@@ -478,7 +478,7 @@
       const [cookSearch, setCookSearch] = useState('');
       const [cookFilter, setCookFilter] = useState('Semua');
       const [cookPortion, setCookPortion] = useState(1);
-      const [cookTimers, setCookTimers] = useState([]);
+      const [cookTimers, setCookTimers] = useLocalStorage('klip_cook_timers', []);
       const [cookStepIdx, setCookStepIdx] = useState(0);
       const [wakeLock, setWakeLock] = useState(null);
       const [cookSettings, setCookSettings] = useLocalStorage('klip_cook_settings', { autoWakelock: false, beepType: 'panjang' });
@@ -663,8 +663,14 @@
                    changed = true;
                    toast(`Tenggat Waktu: ${t.text}`);
                    playClick('panjang');
-                   if (Notification && Notification.permission === 'granted') {
-                       new Notification("Tenggat Tugas", { body: t.text });
+                   if (window.Notification && Notification.permission === 'granted') {
+                       if ('serviceWorker' in navigator && navigator.serviceWorker.ready) {
+                           navigator.serviceWorker.ready.then(reg => {
+                               reg.showNotification("Tenggat Tugas", { body: t.text, icon: './manifest.json' });
+                           }).catch(() => new Notification("Tenggat Tugas", { body: t.text }));
+                       } else {
+                           new Notification("Tenggat Tugas", { body: t.text });
+                       }
                    }
                    return { ...t, alarmed: true };
                 }
@@ -705,6 +711,15 @@
                   setTimeout(() => playClick('success'), 1200);
                 }
                 toast(`Timer Selesai: ${t.title}`);
+                if (window.Notification && Notification.permission === 'granted') {
+                    if ('serviceWorker' in navigator && navigator.serviceWorker.ready) {
+                        navigator.serviceWorker.ready.then(reg => {
+                            reg.showNotification("Timer Selesai", { body: t.title, icon: './manifest.json' });
+                        }).catch(() => new Notification("Timer Selesai", { body: t.title }));
+                    } else {
+                        new Notification("Timer Selesai", { body: t.title });
+                    }
+                }
                 return { ...t, active: false };
               }
               return t;
