@@ -76,6 +76,15 @@
         }
         .toggle-track[data-on="true"] .toggle-thumb { transform: translateX(1.5rem); }
         .toggle-track[data-on="false"] .toggle-thumb { transform: translateX(0.25rem); }
+        html, body {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            position: fixed;
+            overscroll-behavior: none;
+        }
     </style>
     <script type="importmap">
     {
@@ -89,7 +98,7 @@
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
 </head>
-<body class="bg-neutral-100 dark:bg-[#0c0f1a] min-h-screen font-sans text-slate-900 dark:text-slate-100 select-none overflow-hidden overscroll-none antialiased">
+<body class="bg-neutral-100 dark:bg-[#0c0f1a] font-sans text-slate-900 dark:text-slate-100 select-none antialiased">
 <div id="root"></div>
 <script type="text/babel" data-type="module">
     import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
@@ -640,7 +649,25 @@
 
       useEffect(() => {
         const t = setTimeout(() => setShowSplash(false), 1600);
-        return () => clearTimeout(t);
+        
+        const enterFullscreen = () => {
+          const doc = document.documentElement;
+          if (doc.requestFullscreen) doc.requestFullscreen();
+          else if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
+          else if (doc.msRequestFullscreen) doc.msRequestFullscreen();
+          
+          window.removeEventListener('click', enterFullscreen);
+          window.removeEventListener('touchstart', enterFullscreen);
+        };
+        
+        window.addEventListener('click', enterFullscreen);
+        window.addEventListener('touchstart', enterFullscreen);
+
+        return () => {
+          clearTimeout(t);
+          window.removeEventListener('click', enterFullscreen);
+          window.removeEventListener('touchstart', enterFullscreen);
+        };
       }, []);
 
       useEffect(() => {
@@ -3975,7 +4002,7 @@
          ROOT
       ═════════════════════════════════════ */
       return(
-        <div className="w-full h-[100dvh] bg-[#FAFAFA] dark:bg-[#0c0f1a] flex flex-col relative overflow-hidden sm:max-w-md sm:mx-auto sm:border-x sm:border-slate-200 dark:border-slate-800 pb-[env(safe-area-inset-bottom)]">
+        <div className="fixed inset-0 bg-[#FAFAFA] dark:bg-[#0c0f1a] flex flex-col overflow-hidden sm:max-w-md sm:mx-auto sm:border-x sm:border-slate-200 dark:border-slate-800 pb-[env(safe-area-inset-bottom)]">
           {renderKlipBubble()}
           {reduceMotion !== 'default' && (
             <style>
