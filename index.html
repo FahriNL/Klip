@@ -2828,7 +2828,7 @@
             const step = r.steps[cookStepIdx];
             const isLast = cookStepIdx === r.steps.length - 1;
             return (
-                <div className="fixed inset-0 z-50 bg-[#FAFAFA] dark:bg-slate-950 flex flex-col sm:max-w-md sm:mx-auto pt-10 pb-6 pl-6 pr-20 slide-up overflow-hidden">
+                <div className="fixed inset-0 z-50 bg-[#FAFAFA] dark:bg-slate-950 flex flex-col sm:max-w-md sm:mx-auto pt-10 pb-6 px-6 slide-up overflow-hidden">
                    <div className="flex justify-between items-center mb-8">
                       <div className="flex items-center gap-2">
                          <button onClick={() => {setCookActiveView('detail'); releaseWakeLock();}} className="h-10 w-10 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-600 dark:text-slate-400 active:scale-90"><ArrowLeft size={18}/></button>
@@ -2839,9 +2839,9 @@
                       </button>
                    </div>
                    
-                   <div className="flex-1 flex flex-col justify-center overflow-y-auto hide-scrollbar pb-10">
+                   <div className="flex-1 flex flex-col justify-start pt-10 overflow-y-auto hide-scrollbar pb-10">
                       <p className="text-sm font-bold text-slate-400 uppercase tracking-widest mb-4">Langkah {cookStepIdx + 1} dari {r.steps.length}</p>
-                      <h3 className="text-3xl font-black text-slate-800 dark:text-slate-100 leading-tight mb-10">
+                      <h3 className="text-2xl font-black text-slate-800 dark:text-slate-100 leading-tight mb-10">
                          {step.text}
                       </h3>
                       
@@ -2862,7 +2862,7 @@
                       {renderTimers()}
                    </div>
                    
-                   <div className="flex gap-4 mt-auto pt-4 pb-4 pr-16 border-t border-slate-200 dark:border-slate-800 bg-[#FAFAFA] dark:bg-slate-950 relative z-[60] shrink-0">
+                   <div className="flex gap-4 mt-auto pt-4 pb-12 px-4 border-t border-slate-200 dark:border-slate-800 bg-[#FAFAFA] dark:bg-slate-950 relative z-[60] shrink-0">
                       <button disabled={cookStepIdx === 0} onClick={() => setCookStepIdx(i => Math.max(0, i - 1))} className="h-16 w-16 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded-2xl flex items-center justify-center disabled:opacity-30 active:scale-[0.98]">
                          <ArrowLeft size={24}/>
                       </button>
@@ -3802,7 +3802,7 @@
         let bubbleW, bubbleH, bubbleR;
         if (bubbleExpanded) {
           bubbleW = 'w-[calc(100%-1.5rem)] max-w-[380px]'; 
-          bubbleH = activeTimer ? 'h-[160px]' : 'h-[320px]';
+          bubbleH = 'h-[160px]';
           bubbleR = 'rounded-[2.5rem]';
         } else if (isShowingToast) {
           bubbleW = 'w-auto min-w-[140px] max-w-[280px]'; bubbleH = 'h-[36px]'; bubbleR = 'rounded-[18px]';
@@ -3814,7 +3814,7 @@
 
         return (
           <>
-            {bubbleExpanded && <div className="absolute inset-0 z-[140] bg-black/30 backdrop-blur-[2px]" onClick={() => { setBubbleExpanded(false); playClick('soft'); }} />}
+            {bubbleExpanded && <div className="absolute inset-0 z-[140] bg-black/30 " onClick={() => { setBubbleExpanded(false); playClick('soft'); }} />}
             <div className="absolute top-2 left-1/2 -translate-x-1/2 z-[150] pointer-events-none flex justify-center w-full">
               <div
                 onClick={(e) => { e.stopPropagation(); if (!bubbleExpanded) { setBubbleExpanded(true); playClick('soft'); } }}
@@ -4001,7 +4001,7 @@
             </div>
           )}
 
-          {drawerOpen&&<div className="absolute inset-0 bg-slate-900/40 dark:bg-black/40 backdrop-blur-[2px] z-40" onClick={()=>snapDrawer(false)}/>}
+          {drawerOpen&&<div className="absolute inset-0 bg-slate-900/40 dark:bg-black/40  z-40" onClick={()=>snapDrawer(false)}/>}
 
           <div className="px-6 pt-10 pb-2 z-10 flex justify-between items-center bg-[#FAFAFA]/90 dark:bg-[#0c0f1a]/90 backdrop-blur-md flex-shrink-0">
             <div className="flex items-center gap-2">
@@ -4065,7 +4065,7 @@
           {/* Modal QR Code (Global) */}
           {qrItem && (
             <div className="absolute inset-0 z-[100] flex items-center justify-center" onClick={()=>setQrItem(null)}>
-              <div className="absolute inset-0 bg-slate-900/40 dark:bg-black/40 backdrop-blur-[2px] slide-up" style={{animationDuration: '200ms'}}/>
+              <div className="absolute inset-0 bg-slate-900/40 dark:bg-black/40  slide-up" style={{animationDuration: '200ms'}}/>
               <div className="bg-white dark:bg-slate-900 w-[280px] p-6 rounded-3xl shadow-2xl z-20 fade-in slide-up" onClick={e=>e.stopPropagation()}>
                 <div className="bg-white p-3 rounded-2xl mb-4 shadow-sm border border-slate-100 dark:border-slate-800 mx-auto w-max [&>svg]:w-48 [&>svg]:h-48" dangerouslySetInnerHTML={{__html: generateQR(getDisplayValue(qrItem))}}></div>
                 <h3 className="text-center font-bold text-slate-800 dark:text-slate-200 text-lg mb-1 truncate">{qrItem.title}</h3>
