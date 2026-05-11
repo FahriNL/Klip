@@ -3869,7 +3869,7 @@
         } else if (isShowingToast) {
           bubbleW = 'w-auto min-w-[140px] max-w-[280px]'; bubbleH = 'h-[36px]'; bubbleR = 'rounded-[18px]';
         } else if (activeTimer) {
-          bubbleW = 'w-[150px]'; bubbleH = 'h-[36px]'; bubbleR = 'rounded-[18px]';
+          bubbleW = 'w-[150px]'; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
         } else {
           bubbleW = 'w-[100px]'; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
         }
@@ -3889,9 +3889,8 @@
                     {isShowingToast ? (
                        <span className="text-white text-[0.6875rem] font-bold truncate">{toastMsg}</span>
                     ) : activeTimer ? (
-                       <div className="flex items-center gap-2 w-full justify-center">
-                          <Timer size={13} className={activeTimer.paused ? "text-amber-400" : "text-emerald-400"} />
-                          <span className="text-white text-sm font-mono font-black flex-1 text-center">{remText}</span>
+                       <div className="flex items-center justify-between w-full px-1">
+                          <span className="text-white text-[0.8125rem] font-mono font-black">{remText}</span>
                           <div className={"w-1.5 h-1.5 rounded-full " + (activeTimer.paused ? "bg-amber-400" : "bg-emerald-400 animate-pulse")} />
                        </div>
                     ) : null}
