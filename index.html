@@ -651,22 +651,38 @@
         const t = setTimeout(() => setShowSplash(false), 1600);
         
         const enterFullscreen = () => {
+          const isFullscreen = document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
+          if (isFullscreen) {
+            cleanup();
+            return;
+          }
+
           const doc = document.documentElement;
-          if (doc.requestFullscreen) doc.requestFullscreen();
-          else if (doc.webkitRequestFullscreen) doc.webkitRequestFullscreen();
-          else if (doc.msRequestFullscreen) doc.msRequestFullscreen();
+          const req = doc.requestFullscreen || doc.webkitRequestFullscreen || doc.msRequestFullscreen;
           
-          window.removeEventListener('click', enterFullscreen);
-          window.removeEventListener('touchstart', enterFullscreen);
+          if (req) {
+            const promise = req.call(doc);
+            if (promise && promise.then) {
+              promise.then(() => cleanup()).catch(() => {});
+            } else {
+              cleanup();
+            }
+          } else {
+            cleanup();
+          }
+        };
+
+        const cleanup = () => {
+          window.removeEventListener('click', enterFullscreen, { capture: true });
+          window.removeEventListener('touchstart', enterFullscreen, { capture: true });
         };
         
-        window.addEventListener('click', enterFullscreen);
-        window.addEventListener('touchstart', enterFullscreen);
+        window.addEventListener('click', enterFullscreen, { capture: true });
+        window.addEventListener('touchstart', enterFullscreen, { capture: true });
 
         return () => {
           clearTimeout(t);
-          window.removeEventListener('click', enterFullscreen);
-          window.removeEventListener('touchstart', enterFullscreen);
+          cleanup();
         };
       }, []);
 
