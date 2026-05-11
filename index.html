@@ -3914,11 +3914,13 @@
               >
                 {/* Collapsed State */}
                 {!bubbleExpanded && (
-                  <div className="absolute inset-0 flex items-center justify-center px-3.5 gap-2 whitespace-nowrap">
+                  <div className="absolute inset-0 flex items-center whitespace-nowrap overflow-hidden">
                     {isShowingToast ? (
-                       <span className="text-white text-[0.6875rem] font-bold truncate">{toastMsg}</span>
+                       <div className="w-full flex justify-center px-4">
+                          <span className="text-white text-[0.6875rem] font-bold truncate">{toastMsg}</span>
+                       </div>
                     ) : activeTimer ? (
-                       <div className="flex items-center justify-between w-full px-2.5">
+                       <div className="flex items-center justify-between w-full px-2">
                           <span className="text-white text-[0.8125rem] font-mono font-black">{remText}</span>
                           <Timer size={14} className={(activeTimer.paused ? "text-amber-400" : "text-emerald-400") + " " + (!activeTimer.paused ? "animate-pulse" : "")} />
                        </div>
