@@ -496,6 +496,8 @@
       const [bubbleExpanded, setBubbleExpanded] = useState(false);
       const [sysLogs, setSysLogs] = useState([]);
       const [bubbleTopOffset, setBubbleTopOffset] = useLocalStorage('klip_bubble_top_offset', 8);
+      const [bubbleTimerWidth, setBubbleTimerWidth] = useLocalStorage('klip_bubble_timer_width', 120);
+      const [bubbleIdleWidth, setBubbleIdleWidth] = useLocalStorage('klip_bubble_idle_width', 100);
 
       const toggleTimerPause = (id) => {
         setCookTimers(prev => prev.map(t => {
@@ -3283,6 +3285,33 @@
                       />
                       <p className="text-[0.5rem] text-slate-400 mt-1.5 leading-relaxed">{tr('Sesuaikan agar Klip Bubble pas dengan kamera/notch HP Anda.','Adjust Klip Bubble to match your phone\'s camera or notch.')}</p>
                     </div>
+
+                    <div className="mt-4 pt-4 border-t border-slate-200/50 dark:border-slate-700/50 space-y-4">
+                      <div>
+                        <div className="flex justify-between items-center mb-1.5">
+                          <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{tr('Lebar Mode Idle','Idle Width')}</p>
+                          <span className="text-[0.625rem] font-bold text-slate-500 dark:text-slate-400">{bubbleIdleWidth}px</span>
+                        </div>
+                        <input 
+                          type="range" min="60" max="200" step="2" value={bubbleIdleWidth} 
+                          onChange={e => { setBubbleIdleWidth(parseInt(e.target.value)); playClick('soft'); }} 
+                          className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer" 
+                          style={{ accentColor: th.hex }}
+                        />
+                      </div>
+                      <div>
+                        <div className="flex justify-between items-center mb-1.5">
+                          <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{tr('Lebar Mode Timer','Timer Width')}</p>
+                          <span className="text-[0.625rem] font-bold text-slate-500 dark:text-slate-400">{bubbleTimerWidth}px</span>
+                        </div>
+                        <input 
+                          type="range" min="80" max="300" step="2" value={bubbleTimerWidth} 
+                          onChange={e => { setBubbleTimerWidth(parseInt(e.target.value)); playClick('soft'); }} 
+                          className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer" 
+                          style={{ accentColor: th.hex }}
+                        />
+                      </div>
+                    </div>
                   </div>
               </section>
 
@@ -3867,11 +3896,11 @@
           bubbleH = 'h-[160px]';
           bubbleR = 'rounded-[2.5rem]';
         } else if (isShowingToast) {
-          bubbleW = 'w-auto min-w-[140px] max-w-[280px]'; bubbleH = 'h-[36px]'; bubbleR = 'rounded-[18px]';
+          bubbleW = 'w-auto min-w-[140px] max-w-[280px]'; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
         } else if (activeTimer) {
-          bubbleW = 'w-[110px]'; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
+          bubbleW = `w-[${bubbleTimerWidth}px]`; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
         } else {
-          bubbleW = 'w-[100px]'; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
+          bubbleW = `w-[${bubbleIdleWidth}px]`; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
         }
 
         return (
@@ -3889,9 +3918,9 @@
                     {isShowingToast ? (
                        <span className="text-white text-[0.6875rem] font-bold truncate">{toastMsg}</span>
                     ) : activeTimer ? (
-                       <div className="flex items-center justify-between w-full px-1">
+                       <div className="flex items-center justify-between w-full px-2.5">
                           <span className="text-white text-[0.8125rem] font-mono font-black">{remText}</span>
-                          <div className={"w-1.5 h-1.5 rounded-full " + (activeTimer.paused ? "bg-amber-400" : "bg-emerald-400 animate-pulse")} />
+                          <Timer size={14} className={(activeTimer.paused ? "text-amber-400" : "text-emerald-400") + " " + (!activeTimer.paused ? "animate-pulse" : "")} />
                        </div>
                     ) : null}
                   </div>
