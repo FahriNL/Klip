@@ -76,15 +76,6 @@
         }
         .toggle-track[data-on="true"] .toggle-thumb { transform: translateX(1.5rem); }
         .toggle-track[data-on="false"] .toggle-thumb { transform: translateX(0.25rem); }
-        html, body {
-            height: 100%;
-            width: 100%;
-            margin: 0;
-            padding: 0;
-            overflow: hidden;
-            position: fixed;
-            overscroll-behavior: none;
-        }
     </style>
     <script type="importmap">
     {
@@ -98,7 +89,7 @@
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
 </head>
-<body class="bg-neutral-100 dark:bg-[#0c0f1a] font-sans text-slate-900 dark:text-slate-100 select-none antialiased">
+<body class="bg-neutral-100 dark:bg-[#0c0f1a] min-h-screen font-sans text-slate-900 dark:text-slate-100 select-none overflow-hidden overscroll-none antialiased">
 <div id="root"></div>
 <script type="text/babel" data-type="module">
     import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
@@ -649,41 +640,7 @@
 
       useEffect(() => {
         const t = setTimeout(() => setShowSplash(false), 1600);
-        
-        const enterFullscreen = () => {
-          const isFullscreen = document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
-          if (isFullscreen) {
-            cleanup();
-            return;
-          }
-
-          const doc = document.documentElement;
-          const req = doc.requestFullscreen || doc.webkitRequestFullscreen || doc.msRequestFullscreen;
-          
-          if (req) {
-            const promise = req.call(doc);
-            if (promise && promise.then) {
-              promise.then(() => cleanup()).catch(() => {});
-            } else {
-              cleanup();
-            }
-          } else {
-            cleanup();
-          }
-        };
-
-        const cleanup = () => {
-          window.removeEventListener('click', enterFullscreen, { capture: true });
-          window.removeEventListener('touchstart', enterFullscreen, { capture: true });
-        };
-        
-        window.addEventListener('click', enterFullscreen, { capture: true });
-        window.addEventListener('touchstart', enterFullscreen, { capture: true });
-
-        return () => {
-          clearTimeout(t);
-          cleanup();
-        };
+        return () => clearTimeout(t);
       }, []);
 
       useEffect(() => {
@@ -4018,7 +3975,7 @@
          ROOT
       ═════════════════════════════════════ */
       return(
-        <div className="fixed inset-0 bg-[#FAFAFA] dark:bg-[#0c0f1a] flex flex-col overflow-hidden sm:max-w-md sm:mx-auto sm:border-x sm:border-slate-200 dark:border-slate-800 pb-[env(safe-area-inset-bottom)]">
+        <div className="w-full h-[100dvh] bg-[#FAFAFA] dark:bg-[#0c0f1a] flex flex-col relative overflow-hidden sm:max-w-md sm:mx-auto sm:border-x sm:border-slate-200 dark:border-slate-800 pb-[env(safe-area-inset-bottom)]">
           {renderKlipBubble()}
           {reduceMotion !== 'default' && (
             <style>
