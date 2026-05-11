@@ -76,6 +76,15 @@
         }
         .toggle-track[data-on="true"] .toggle-thumb { transform: translateX(1.5rem); }
         .toggle-track[data-on="false"] .toggle-thumb { transform: translateX(0.25rem); }
+        html, body {
+            height: 100%;
+            width: 100%;
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            position: fixed;
+            overscroll-behavior: none;
+        }
     </style>
     <script type="importmap">
     {
@@ -89,7 +98,7 @@
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.min.js"></script>
 </head>
-<body class="bg-neutral-100 dark:bg-[#0c0f1a] min-h-screen font-sans text-slate-900 dark:text-slate-100 select-none overflow-hidden overscroll-none antialiased">
+<body class="bg-neutral-100 dark:bg-[#0c0f1a] font-sans text-slate-900 dark:text-slate-100 select-none antialiased">
 <div id="root"></div>
 <script type="text/babel" data-type="module">
     import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
@@ -486,6 +495,7 @@
       /* ── Bubble state ── */
       const [bubbleExpanded, setBubbleExpanded] = useState(false);
       const [sysLogs, setSysLogs] = useState([]);
+      const [bubbleTopOffset, setBubbleTopOffset] = useLocalStorage('klip_bubble_top_offset', 8);
 
       const toggleTimerPause = (id) => {
         setCookTimers(prev => prev.map(t => {
@@ -640,7 +650,41 @@
 
       useEffect(() => {
         const t = setTimeout(() => setShowSplash(false), 1600);
-        return () => clearTimeout(t);
+        
+        const enterFullscreen = () => {
+          const isFullscreen = document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement;
+          if (isFullscreen) {
+            cleanup();
+            return;
+          }
+
+          const doc = document.documentElement;
+          const req = doc.requestFullscreen || doc.webkitRequestFullscreen || doc.msRequestFullscreen;
+          
+          if (req) {
+            const promise = req.call(doc);
+            if (promise && promise.then) {
+              promise.then(() => cleanup()).catch(() => {});
+            } else {
+              cleanup();
+            }
+          } else {
+            cleanup();
+          }
+        };
+
+        const cleanup = () => {
+          window.removeEventListener('click', enterFullscreen, { capture: true });
+          window.removeEventListener('touchstart', enterFullscreen, { capture: true });
+        };
+        
+        window.addEventListener('click', enterFullscreen, { capture: true });
+        window.addEventListener('touchstart', enterFullscreen, { capture: true });
+
+        return () => {
+          clearTimeout(t);
+          cleanup();
+        };
       }, []);
 
       useEffect(() => {
@@ -3221,6 +3265,24 @@
                         <span className="text-xs font-bold text-slate-600 dark:text-slate-300 group-hover:text-slate-900 dark:group-hover:text-white transition-colors">{tr('Ekstrak Cepat','Quick Extract')}</span>
                       </label>
                     </div>
+
+                    <div className="mt-4 pt-4 border-t border-slate-200/50 dark:border-slate-700/50">
+                      <div className="flex justify-between items-center mb-1.5">
+                        <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{tr('Posisi Vertikal','Vertical Position')}</p>
+                        <span className="text-[0.625rem] font-bold text-slate-500 dark:text-slate-400">{bubbleTopOffset}px</span>
+                      </div>
+                      <input 
+                        type="range" 
+                        min="0" 
+                        max="120" 
+                        step="1" 
+                        value={bubbleTopOffset} 
+                        onChange={e => { setBubbleTopOffset(parseInt(e.target.value)); playClick('soft'); }} 
+                        className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer" 
+                        style={{ accentColor: th.hex }}
+                      />
+                      <p className="text-[0.5rem] text-slate-400 mt-1.5 leading-relaxed">{tr('Sesuaikan agar Klip Bubble pas dengan kamera/notch HP Anda.','Adjust Klip Bubble to match your phone\'s camera or notch.')}</p>
+                    </div>
                   </div>
               </section>
 
@@ -3815,7 +3877,7 @@
         return (
           <>
             {bubbleExpanded && <div className="absolute inset-0 z-[140] bg-transparent" onClick={() => { setBubbleExpanded(false); playClick('soft'); }} />}
-            <div className="absolute top-2 left-1/2 -translate-x-1/2 z-[150] pointer-events-none flex justify-center w-full">
+            <div className="absolute left-1/2 -translate-x-1/2 z-[150] pointer-events-none flex justify-center w-full" style={{ top: `${bubbleTopOffset}px` }}>
               <div
                 onClick={(e) => { e.stopPropagation(); if (!bubbleExpanded) { setBubbleExpanded(true); playClick('soft'); } }}
                 className={bubbleW + " " + bubbleH + " " + bubbleR + " bg-black dark:bg-[#050505] shadow-2xl flex flex-col pointer-events-auto border border-white/[0.08] cursor-pointer overflow-hidden relative"}
@@ -3975,7 +4037,7 @@
          ROOT
       ═════════════════════════════════════ */
       return(
-        <div className="w-full h-[100dvh] bg-[#FAFAFA] dark:bg-[#0c0f1a] flex flex-col relative overflow-hidden sm:max-w-md sm:mx-auto sm:border-x sm:border-slate-200 dark:border-slate-800 pb-[env(safe-area-inset-bottom)]">
+        <div className="fixed inset-0 bg-[#FAFAFA] dark:bg-[#0c0f1a] flex flex-col overflow-hidden sm:max-w-md sm:mx-auto sm:border-x sm:border-slate-200 dark:border-slate-800 pb-[env(safe-area-inset-bottom)]">
           {renderKlipBubble()}
           {reduceMotion !== 'default' && (
             <style>
