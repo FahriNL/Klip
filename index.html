@@ -112,6 +112,249 @@
       Strikethrough, History, ShieldCheck, Shuffle, Volume2, VolumeX, Download, Volume, FileSpreadsheet, Receipt, SpellCheck, Nfc, Globe, Languages, Hand, ShieldOff, QrCode, ArrowRightLeft, ArrowRight, ArrowDownRight, ArrowDown, ArrowLeft, Sparkles, Utensils, ChefHat, Timer, Play, Pause, Camera, ListPlus, Flame, ExternalLink
     } from 'lucide-react';
 
+    /* ─── Native Notification Bridge (Capacitor LocalNotifications) ─── */
+    const klipNotify = (() => { // v3 — channel + correct icon + bridge readiness
+      // Hash string ID to a stable integer (Capacitor requires numeric IDs)
+      function _numId(strId) {
+        let hash = 0;
+        for (let i = 0; i < strId.length; i++) {
+          hash = ((hash << 5) - hash + strId.charCodeAt(i)) | 0;
+        }
+        return Math.abs(hash) % 2000000000 || 1;
+      }
+
+      const ICON = 'ic_stat_notify';   // monochrome drawable in res/drawable/
+      const CHANNEL_ID = 'klip_alerts'; // notification channel for Android 8+
+
+      // Get Capacitor LocalNotifications plugin safely
+      function _ln() {
+        try { return window.Capacitor?.Plugins?.LocalNotifications || null; }
+        catch { return null; }
+      }
+
+      // Native Android alarm bridge. It posts notifications from a BroadcastReceiver,
+      // so scheduled timers still fire after the WebView/React process is closed.
+      function _nativeAlarm() {
+        try { return window.Capacitor?.Plugins?.KlipAlarm || null; }
+        catch { return null; }
+      }
+
+      // Promise that resolves once the Capacitor bridge + plugin are available
+      const _ready = new Promise(resolve => {
+        if (_ln() || _nativeAlarm()) { resolve(); return; }
+        let tries = 0;
+        const iv = setInterval(() => {
+          if (_ln() || _nativeAlarm() || ++tries > 100) { clearInterval(iv); resolve(); }
+        }, 50);
+      });
+
+      // Permission
+      let _permGranted = false;
+      async function _ensurePermission() {
+        await _ready;
+        const ln = _ln();
+        if (!ln) return false;
+        if (_permGranted) return true;
+        try {
+          let { display } = await ln.checkPermissions();
+          if (display !== 'granted') {
+            const res = await ln.requestPermissions();
+            display = res.display;
+          }
+          _permGranted = (display === 'granted');
+          console.log('[klipNotify] permission:', display);
+        } catch (e) { console.warn('[klipNotify] permission error', e); }
+        return _permGranted;
+      }
+
+      // Notification channel (Android 8+ / API 26+)
+      let _channelCreated = false;
+      async function _ensureChannel() {
+        if (_channelCreated) return;
+        const ln = _ln();
+        if (!ln || typeof ln.createChannel !== 'function') { _channelCreated = true; return; }
+        try {
+          await ln.createChannel({
+            id: CHANNEL_ID,
+            name: 'Klip Alerts',
+            description: 'Timer masak dan tenggat tugas',
+            importance: 5,
+            visibility: 1,
+            sound: 'default',
+            vibration: true,
+            lights: true
+          });
+          console.log('[klipNotify] channel created:', CHANNEL_ID);
+        } catch (e) { console.warn('[klipNotify] createChannel error', e); }
+        _channelCreated = true;
+      }
+
+      let _exactAlarmPrompted = false;
+      async function _ensureExactAlarmAccess() {
+        const ln = _ln();
+        if (!ln || typeof ln.checkExactNotificationSetting !== 'function') return;
+        try {
+          const res = await ln.checkExactNotificationSetting();
+          if (res?.exact_alarm === 'denied' && !_exactAlarmPrompted && typeof ln.changeExactNotificationSetting === 'function') {
+            _exactAlarmPrompted = true;
+            await ln.changeExactNotificationSetting();
+          }
+        } catch (e) { console.warn('[klipNotify] exact alarm check error', e); }
+      }
+
+      async function _scheduleLocal({ id, title, body, atMs }) {
+        const ln = _ln();
+        if (!ln) return false;
+        await ln.schedule({
+          notifications: [{
+            id: _numId(id),
+            channelId: CHANNEL_ID,
+            title,
+            body,
+            schedule: { at: new Date(atMs), allowWhileIdle: true },
+            smallIcon: ICON,
+            sound: 'default',
+            extra: { sourceId: id }
+          }]
+        });
+        return true;
+      }
+
+      // Boot: init permission + channel
+      _ready.then(async () => {
+        await _ensurePermission();
+        await _ensureChannel();
+        try { await _nativeAlarm()?.restorePending?.(); } catch (e) { console.warn('[klipNotify] native restore error', e); }
+      });
+
+      return {
+        // Schedule a notification at a specific future timestamp (atMs)
+        async schedule({ id, title, body, atMs }) {
+          await _ready;
+          if (atMs - Date.now() <= 0) return;
+          const ok = await _ensurePermission();
+          if (!ok) { console.warn('[klipNotify] permission denied'); return; }
+          await _ensureChannel();
+          await _ensureExactAlarmAccess();
+
+          const nativeAlarm = _nativeAlarm();
+          if (nativeAlarm) {
+            try {
+              try { await _ln()?.cancel?.({ notifications: [{ id: _numId(id) }] }); } catch {}
+              await nativeAlarm.schedule({ id, title, body, atMs });
+              console.log('[klipNotify] native scheduled:', title, 'at', new Date(atMs).toLocaleTimeString());
+              return;
+            } catch (e) {
+              console.warn('[klipNotify] native schedule error, falling back', e);
+            }
+          }
+
+          try {
+            const scheduled = await _scheduleLocal({ id, title, body, atMs });
+            if (!scheduled) { console.warn('[klipNotify] plugin not available'); return; }
+            console.log('[klipNotify] scheduled:', title, 'at', new Date(atMs).toLocaleTimeString());
+          } catch (e) { console.warn('[klipNotify] schedule error', e); }
+        },
+
+        // Cancel a previously scheduled notification by its string ID
+        async cancel(id) {
+          await _ready;
+          const nativeAlarm = _nativeAlarm();
+          if (nativeAlarm) {
+            try { await nativeAlarm.cancel({ id }); }
+            catch (e) { console.warn('[klipNotify] native cancel error', e); }
+          }
+
+          const ln = _ln();
+          if (!ln) return;
+          try {
+            await ln.cancel({ notifications: [{ id: _numId(id) }] });
+          } catch (e) { console.warn('[klipNotify] cancel error', e); }
+        },
+
+        // Fire an immediate notification (2-second delay so system accepts it)
+        async fireNow({ title, body }) {
+          await _ready;
+          const ok = await _ensurePermission();
+          if (!ok) return;
+          await _ensureChannel();
+          await _ensureExactAlarmAccess();
+
+          const id = 'instant_' + Date.now() + '_' + Math.floor(Math.random() * 100000);
+          const atMs = Date.now() + 2000;
+          const nativeAlarm = _nativeAlarm();
+          if (nativeAlarm) {
+            try {
+              await nativeAlarm.schedule({ id, title, body, atMs });
+              return;
+            } catch (e) {
+              console.warn('[klipNotify] native fireNow error, falling back', e);
+            }
+          }
+
+          try {
+            await _scheduleLocal({ id, title, body, atMs });
+          } catch (e) { console.warn('[klipNotify] fireNow error', e); }
+        },
+
+        // Re-sync all timers & tasks with OS on every app launch
+        async syncOnLaunch({ cookTimers = [], tugasItems = [] }) {
+          await _ready;
+          const ok = await _ensurePermission();
+          if (!ok) return;
+          await _ensureChannel();
+          await _ensureExactAlarmAccess();
+          try { await _nativeAlarm()?.restorePending?.(); } catch (e) { console.warn('[klipNotify] native restore error', e); }
+          const now = Date.now();
+          const notifications = [];
+
+          for (const t of cookTimers) {
+            if (!t.active || t.paused) continue;
+            const endMs = t.endMs || 0;
+            if (endMs > now + 3000) {
+              notifications.push({
+                id: 'cook_' + t.id,
+                title: 'Timer Selesai 🍳',
+                body: t.title,
+                atMs: endMs
+              });
+            }
+          }
+
+          for (const t of tugasItems) {
+            if (t.isDone || t.alarmed) continue;
+            const dl = t.deadline || 0;
+            if (dl > now + 3000) {
+              notifications.push({
+                id: 'tugas_' + t.id,
+                title: 'Tenggat Tugas ⏰',
+                body: t.text,
+                atMs: dl
+              });
+            }
+          }
+
+          if (notifications.length > 0) {
+            try {
+              for (const notification of notifications) {
+                const nativeAlarm = _nativeAlarm();
+                if (nativeAlarm) {
+                  try { await _ln()?.cancel?.({ notifications: [{ id: _numId(notification.id) }] }); } catch {}
+                  await nativeAlarm.schedule(notification);
+                } else {
+                  await _scheduleLocal(notification);
+                }
+              }
+              console.log(`[klipNotify] syncOnLaunch: ${notifications.length} notif(s) registered with OS`);
+            } catch (e) { console.warn('[klipNotify] syncOnLaunch error', e); }
+          } else {
+            console.log('[klipNotify] syncOnLaunch: nothing pending');
+          }
+        }
+      };
+    })();
+
+
     /* ─── Themes ─────────────────────────────────── */
     const THEMES = {
       slate:   { bg:'bg-slate-800 dark:bg-slate-600',   text:'text-slate-800 dark:text-slate-300',   border:'border-slate-800 dark:border-slate-600',   light:'bg-slate-100 dark:bg-slate-800/80',  glow:'shadow-[0_0_20px_rgba(15,23,42,0.4)] dark:shadow-[0_0_20px_rgba(100,116,139,0.3)]',   dialText:'text-slate-400 dark:text-slate-400', hex:'#334155', toggleOn:'bg-slate-800 dark:bg-slate-500' },
@@ -177,7 +420,7 @@
       return qr.createSvgTag({ scalable: true });
     };
 
-    const fmt = (raw) => { const d=String(raw).replace(/\D/g,''); return d?parseInt(d,10).toLocaleString('id-ID'):''; };
+    const fmt = (raw) => { const d=String(raw).replace(/\D/g,''); if(d) playClick('tick'); return d?parseInt(d,10).toLocaleString('id-ID'):''; };
     const parse = (s) => s.replace(/\./g,'').replace(/,/g,'').replace(/\D/g,'');
 
     const pwdStrength = (p) => {
@@ -329,7 +572,7 @@
       </div>
     );
 
-    const CookTimerItem = ({ t, setCookTimers }) => {
+    const CookTimerItem = ({ t, onPause, onSkip, onCancel }) => {
       const [rem, setRem] = React.useState(t.active && !t.paused ? Math.max(0, t.endMs - Date.now()) : (t.paused ? t.remainingMs : 0));
       React.useEffect(() => {
         if (!t.active || t.paused) { setRem(t.paused ? t.remainingMs : 0); return; }
@@ -340,17 +583,30 @@
       const s = Math.floor((rem % 60000) / 1000);
       const pct = t.durationMs ? (1 - (rem / t.durationMs)) * 100 : 100;
       return (
-        <div className="bg-white dark:bg-slate-900 p-3 rounded-2xl border border-slate-200 dark:border-slate-700 relative overflow-hidden flex items-center justify-between shadow-sm">
+        <div className="bg-white dark:bg-slate-900 p-3 rounded-2xl border border-slate-200 dark:border-slate-700 relative overflow-hidden shadow-sm">
           <div className="absolute top-0 left-0 bottom-0 bg-blue-500/10 dark:bg-blue-500/20 transition-all duration-1000 linear" style={{ width: `${Math.min(100, Math.max(0, pct))}%` }} />
-          <div className="relative z-10 flex items-center gap-2">
-            <Timer size={16} className={t.active ? (t.paused ? "text-amber-500" : "text-blue-500") : "text-slate-400"} />
-            <span className="text-sm font-bold text-slate-700 dark:text-slate-300">{t.title}</span>
-          </div>
-          <div className="flex items-center gap-3 relative z-10">
-            <div className={`font-mono font-black text-lg ${rem <= 10000 && t.active && !t.paused ? 'text-rose-500 animate-pulse' : 'text-slate-800 dark:text-slate-200'}`}>
-              {m}:{s.toString().padStart(2, '0')}
+          <div className="relative z-10 flex items-center gap-3 min-w-0">
+            <div className="h-9 w-9 rounded-xl bg-blue-50 dark:bg-blue-500/10 flex items-center justify-center flex-shrink-0">
+              <Timer size={16} className={t.active ? (t.paused ? "text-amber-500" : "text-blue-500") : "text-slate-400"} />
             </div>
-            <button onClick={() => setCookTimers(p => p.filter(x => x.id !== t.id))} className="h-8 w-8 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-400 active:scale-90"><X size={14} /></button>
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center justify-between gap-3 min-w-0">
+                <span className="text-sm font-black text-slate-700 dark:text-slate-300 truncate">{t.title}</span>
+                <div className={`font-mono font-black text-lg flex-shrink-0 ${rem <= 10000 && t.active && !t.paused ? 'text-rose-500 animate-pulse' : 'text-slate-800 dark:text-slate-200'}`}>
+                  {m}:{s.toString().padStart(2, '0')}
+                </div>
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <button onClick={() => onSkip(t.id, 60000)} className="h-8 px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 font-black text-xs active:scale-95">-1m</button>
+                  <button onClick={() => onPause(t.id)} className={`h-8 w-10 rounded-xl flex items-center justify-center active:scale-95 ${t.paused ? 'bg-amber-500 text-white' : 'bg-slate-900 dark:bg-white text-white dark:text-slate-900'}`}>
+                    {t.paused ? <Play size={15} fill="currentColor" /> : <Pause size={15} fill="currentColor" />}
+                  </button>
+                  <button onClick={() => onSkip(t.id, -60000)} className="h-8 px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400 font-black text-xs active:scale-95">+1m</button>
+                </div>
+                <button onClick={() => onCancel(t.id)} className="h-8 w-8 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-400 active:scale-90 flex-shrink-0"><X size={14} /></button>
+              </div>
+            </div>
           </div>
         </div>
       );
@@ -461,10 +717,219 @@
       );
     };
 
+    function parseQuickRecipe(rawText) {
+      const rawLines = String(rawText || '')
+        .replace(/\r/g, '')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean);
+
+      const lines = rawLines.map(line => line
+        .replace(/^[\s>*•\-–—]+/, '')
+        .replace(/^\d+[\).]\s*/, '')
+        .trim()
+      ).filter(Boolean);
+
+      const isIngredientHeading = line => /^(bahan|bahan[-\s]*bahan|ingredients?|komposisi)\b/i.test(line.replace(/:$/, ''));
+      const isStepHeading = line => /^(cara|cara membuat|langkah|langkah[-\s]*langkah|instruksi|petunjuk|directions?|method|steps?)\b/i.test(line.replace(/:$/, ''));
+      const isTitleLabel = line => /^(judul|nama resep|resep|title|recipe)\s*:/i.test(line);
+      const cleanHeadingValue = line => line.replace(/^(judul|nama resep|resep|title|recipe)\s*:\s*/i, '').trim();
+
+      const ingIdx = lines.findIndex(isIngredientHeading);
+      const stepIdx = lines.findIndex(isStepHeading);
+      const titleLabel = lines.find(isTitleLabel);
+      const titleIdx = titleLabel ? lines.indexOf(titleLabel) : 0;
+      const title = (titleLabel ? cleanHeadingValue(titleLabel) : lines[0] || 'Resep Cepat')
+        .replace(/^resep\s+/i, '')
+        .slice(0, 80) || 'Resep Cepat';
+
+      const portionMatch = String(rawText).match(/(?:untuk|jadi|porsi|serves?|servings?)\s*:?\s*(\d{1,2})|(\d{1,2})\s*(?:porsi|servings?)/i);
+      const defaultPortions = Math.max(1, Number(portionMatch?.[1] || portionMatch?.[2] || 4));
+
+      const startOfBody = Math.max(titleIdx + 1, 1);
+      const firstSection = [ingIdx, stepIdx].filter(i => i > startOfBody).sort((a,b)=>a-b)[0] ?? Math.min(lines.length, startOfBody + 3);
+      const desc = lines
+        .slice(startOfBody, firstSection)
+        .filter(line => !isIngredientHeading(line) && !isStepHeading(line))
+        .slice(0, 2)
+        .join(' ')
+        .slice(0, 160);
+
+      const fractionMap = { '½': 0.5, '¼': 0.25, '¾': 0.75, '⅓': 1/3, '⅔': 2/3 };
+      const parseAmount = value => {
+        if (!value) return 1;
+        if (fractionMap[value]) return fractionMap[value];
+        const parts = value.replace(',', '.').split(/\s+/);
+        return parts.reduce((sum, part) => {
+          if (/^\d+\/\d+$/.test(part)) {
+            const [a,b] = part.split('/').map(Number);
+            return sum + (b ? a / b : 0);
+          }
+          const num = Number(part);
+          return sum + (Number.isFinite(num) ? num : 0);
+        }, 0) || 1;
+      };
+
+      const parseIngredientLine = line => {
+        const clean = line.replace(/^[•\-–—]\s*/, '').replace(/\s+/g, ' ').trim();
+        const unitPattern = '(?:kg|g|gr|gram|mg|l|ltr|liter|ml|cc|sdm|tbsp|sdt|tsp|cup|cups|c|cangkir|oz|ons|lb|pon|fl oz|pt|pint|qt|quart|gal|galon|pinch|dash|smidgen|siung|ruas|btr|butir|lbr|lembar|btg|batang|ikat|bh|buah|bonggol|sejumput|segenggam|sckp|secukupnya|sedikit|ekor|bks|bungkus|papan|scht|sachet|saset|in|inci|cm)';
+        const match = clean.match(new RegExp(`^((?:\\d+(?:[\\.,]\\d+)?|\\d+\\/\\d+|\\d+\\s+\\d+\\/\\d+|[½¼¾⅓⅔]))\\s*(${unitPattern})?\\s+(.+)$`, 'i'));
+        if (!match) return { name: clean, amount: 1, unit: '' };
+        return {
+          name: match[3].trim(),
+          amount: parseAmount(match[1]),
+          unit: (match[2] || '').trim()
+        };
+      };
+
+      const extractTimer = text => {
+        const match = text.match(/(\d{1,3})(?:\s*[-–]\s*\d{1,3})?\s*(detik|second|seconds|sec|menit|mnt|minute|minutes|min|jam|hour|hours)/i);
+        if (!match) return 0;
+        const n = Number(match[1]);
+        const unit = match[2].toLowerCase();
+        if (unit.startsWith('detik') || unit.startsWith('sec') || unit.startsWith('second')) return n * 1000;
+        if (unit.startsWith('jam') || unit.startsWith('hour')) return n * 3600000;
+        return n * 60000;
+      };
+
+      const looksLikeIngredient = line => /^(\d|[½¼¾⅓⅔]|secukupnya\b)/i.test(line) || /\b(gram|kg|ml|sdm|sdt|siung|butir|buah|lembar|cup|tbsp|tsp)\b/i.test(line);
+      const ingredientLines = ingIdx >= 0
+        ? lines.slice(ingIdx + 1, stepIdx > ingIdx ? stepIdx : lines.length)
+        : lines.filter((line, idx) => idx !== titleIdx && looksLikeIngredient(line));
+
+      const stepLines = stepIdx >= 0
+        ? lines.slice(stepIdx + 1)
+        : lines.filter((line, idx) => idx !== titleIdx && !looksLikeIngredient(line) && !isIngredientHeading(line) && !isStepHeading(line));
+
+      const ingredients = ingredientLines
+        .filter(line => !isIngredientHeading(line) && !isStepHeading(line))
+        .map(parseIngredientLine)
+        .filter(item => item.name);
+
+      const steps = stepLines
+        .filter(line => !isIngredientHeading(line) && !isStepHeading(line))
+        .map(line => ({ text: line, timerMs: extractTimer(line) }))
+        .filter(step => step.text);
+
+      const lower = `${title} ${desc} ${rawText}`.toLowerCase();
+      const tags = [];
+      if (/sarapan|breakfast/.test(lower)) tags.push('Sarapan');
+      if (/minum|jus|kopi|teh|drink|beverage/.test(lower)) tags.push('Minuman');
+      if (/camilan|snack|kue|cookies|goreng/.test(lower)) tags.push('Camilan');
+
+      const warnings = [];
+      if (ingredients.length === 0) warnings.push('Bahan belum terbaca jelas.');
+      if (steps.length === 0) warnings.push('Langkah belum terbaca jelas.');
+
+      return {
+        recipe: {
+          id: Date.now().toString(),
+          title,
+          desc,
+          tags,
+          defaultPortions,
+          ingredients,
+          steps,
+          photo: null
+        },
+        warnings
+      };
+    }
+
 
     /* ═══════════════════════════════════════════════
        MAIN APP
     ══════════════════════════════════════════════════ */
+    
+    const COOK_UNIT_DATA = {
+      ml: { base: 'ml', ratio: 1, type: 'vol', full: 'mililiter', alt: ['ml', 'mililiter'] },
+      l: { base: 'ml', ratio: 1000, type: 'vol', full: 'liter', alt: ['l', 'ltr', 'liter'] },
+      cc: { base: 'ml', ratio: 1, type: 'vol', full: 'cc', alt: ['cc'] },
+      cup: { base: 'ml', ratio: 250, type: 'vol', full: 'cup', alt: ['cup', 'cups', 'c', 'cangkir'] },
+      sdm: { base: 'ml', ratio: 15, type: 'vol', full: 'sendok makan', alt: ['sdm', 'tbsp', 'sendok makan'] },
+      sdt: { base: 'ml', ratio: 5, type: 'vol', full: 'sendok teh', alt: ['sdt', 'tsp', 'sendok teh'] },
+      floz: { base: 'ml', ratio: 30, type: 'vol', full: 'fluid ounce', alt: ['fl oz', 'floz'] },
+      pt: { base: 'ml', ratio: 480, type: 'vol', full: 'pint', alt: ['pt', 'pint'] },
+      qt: { base: 'ml', ratio: 960, type: 'vol', full: 'quart', alt: ['qt', 'quart'] },
+      gal: { base: 'ml', ratio: 3800, type: 'vol', full: 'galon', alt: ['gal', 'galon'] },
+      g: { base: 'g', ratio: 1, type: 'weight', full: 'gram', alt: ['g', 'gr', 'gram'] },
+      kg: { base: 'g', ratio: 1000, type: 'weight', full: 'kilogram', alt: ['kg', 'kilogram'] },
+      mg: { base: 'g', ratio: 0.001, type: 'weight', full: 'miligram', alt: ['mg', 'miligram'] },
+      oz: { base: 'g', ratio: 28.35, type: 'weight', full: 'ounce', alt: ['oz', 'ons'] },
+      lb: { base: 'g', ratio: 454, type: 'weight', full: 'pound', alt: ['lb', 'pon', 'pound'] },
+      siung: { type: 'count', full: 'siung', alt: ['siung'] },
+      butir: { type: 'count', full: 'butir', alt: ['butir', 'btr'] },
+      buah: { type: 'count', full: 'buah', alt: ['buah', 'bh'] },
+      lembar: { type: 'count', full: 'lembar', alt: ['lembar', 'lbr'] },
+      batang: { type: 'count', full: 'batang', alt: ['batang', 'btg'] },
+      ruas: { type: 'count', full: 'ruas', alt: ['ruas'] },
+      ikat: { type: 'count', full: 'ikat', alt: ['ikat'] },
+      bonggol: { type: 'count', full: 'bonggol', alt: ['bonggol'] },
+      sejumput: { type: 'count', full: 'sejumput', alt: ['sejumput', 'pinch', 'dash'] },
+      segenggam: { type: 'count', full: 'segenggam', alt: ['segenggam'] },
+      secukupnya: { type: 'count', full: 'secukupnya', alt: ['secukupnya', 'sckp'] },
+      sedikit: { type: 'count', full: 'sedikit', alt: ['sedikit'] },
+      ekor: { type: 'count', full: 'ekor', alt: ['ekor'] },
+      bungkus: { type: 'count', full: 'bungkus', alt: ['bungkus', 'bks'] },
+      papan: { type: 'count', full: 'papan', alt: ['papan'] },
+      saset: { type: 'count', full: 'sachet', alt: ['sachet', 'saset', 'scht'] },
+      cm: { type: 'count', full: 'cm', alt: ['cm', 'inci', 'in'] },
+    };
+
+    function formatCookAmount(amount, unitStr) {
+      if (!unitStr) return { amount, unit: '' };
+      const lower = unitStr.toLowerCase().trim();
+      let info = null;
+      for (const k in COOK_UNIT_DATA) {
+        if (COOK_UNIT_DATA[k].alt.some(a => a.toLowerCase() === lower)) {
+          info = COOK_UNIT_DATA[k]; break;
+        }
+      }
+
+      const toFrac = (val) => {
+        const w = Math.floor(val);
+        const f = val - w;
+        let s = '';
+        if (f > 0.12 && f < 0.37) s = '1/4';
+        else if (f >= 0.37 && f < 0.62) s = '1/2';
+        else if (f >= 0.62 && f < 0.87) s = '3/4';
+        else if (f >= 0.87) return (w + 1).toString();
+        if (!s) return w > 0 ? w.toString() : val.toPrecision(2).replace(/\.0+$/,'').replace(/(\.\d*?[1-9])0+$/,'$1');
+        return w > 0 ? `${w} ${s}` : s;
+      };
+
+      const cleanNum = (n) => n.toPrecision(4).replace(/\.0+$/,'').replace(/(\.\d*?[1-9])0+$/,'$1');
+
+      if (!info || info.type === 'count') {
+        // Realistic rounding for count items (eggs, cloves, etc.)
+        let rounded = amount;
+        if (amount < 10) {
+          rounded = Math.round(amount * 2) / 2; // round to nearest 0.5
+        } else {
+          rounded = Math.round(amount); // round to nearest 1
+        }
+        return { amount: toFrac(rounded), unit: unitStr };
+      }
+      
+      const baseValue = amount * info.ratio;
+      let finalAmount = amount;
+      let finalUnit = unitStr;
+
+      if (info.type === 'vol') {
+        if (baseValue >= 1000) { finalAmount = baseValue / 1000; finalUnit = 'L'; }
+        else if (baseValue >= 15) { finalAmount = baseValue / 15; finalUnit = 'sdm'; }
+        else if (baseValue >= 5) { finalAmount = baseValue / 5; finalUnit = 'sdt'; }
+        else { finalAmount = baseValue; finalUnit = 'ml'; }
+      } else if (info.type === 'weight') {
+        if (baseValue >= 1000) { finalAmount = baseValue / 1000; finalUnit = 'kg'; }
+        else { finalAmount = baseValue; finalUnit = 'g'; }
+      }
+
+      // For volume/weight, we use fractions only if it's small/simple, otherwise decimals
+      if (finalAmount < 5 && (finalAmount * 2) % 1 === 0) return { amount: toFrac(finalAmount), unit: finalUnit };
+      return { amount: cleanNum(finalAmount), unit: finalUnit };
+    }
+
     function KlipApp() {
       const [isProMode, setIsProMode] = useLocalStorage('klip_pro_mode', false);
       const [activeTheme, setActiveTheme] = useLocalStorage('klip_theme', 'slate');
@@ -491,6 +956,9 @@
       const [cookStepIdx, setCookStepIdx] = useState(0);
       const [wakeLock, setWakeLock] = useState(null);
       const [cookSettings, setCookSettings] = useLocalStorage('klip_cook_settings', { autoWakelock: false, beepType: 'panjang' });
+      const [quickRecipeText, setQuickRecipeText] = useState('');
+      const [quickRecipeDraft, setQuickRecipeDraft] = useState(null);
+      const [quickRecipeWarnings, setQuickRecipeWarnings] = useState([]);
 
       /* ── Bubble state ── */
       const [bubbleExpanded, setBubbleExpanded] = useState(false);
@@ -503,8 +971,13 @@
         setCookTimers(prev => prev.map(t => {
           if (t.id === id) {
             if (t.paused) {
-               return { ...t, paused: false, endMs: Date.now() + t.remainingMs };
+               const newEnd = Date.now() + t.remainingMs;
+               // Reschedule notification on resume
+               klipNotify.schedule({ id: 'cook_' + id, title: tr('Timer Selesai 🍳','Timer Done 🍳'), body: t.title, atMs: newEnd });
+               return { ...t, paused: false, endMs: newEnd };
             } else {
+               // Cancel notification on pause
+               klipNotify.cancel('cook_' + id);
                return { ...t, paused: true, remainingMs: Math.max(0, t.endMs - Date.now()) };
             }
           }
@@ -519,7 +992,10 @@
             if (t.paused) {
                return { ...t, remainingMs: Math.max(0, t.remainingMs - ms) };
             } else {
-               return { ...t, endMs: t.endMs - ms };
+               const newEnd = t.endMs - ms;
+               // Reschedule notification with new end time
+               klipNotify.schedule({ id: 'cook_' + id, title: tr('Timer Selesai 🍳','Timer Done 🍳'), body: t.title, atMs: newEnd });
+               return { ...t, endMs: newEnd };
             }
           }
           return t;
@@ -528,6 +1004,7 @@
       };
 
       const endTimer = (id) => {
+        klipNotify.cancel('cook_' + id);
         setCookTimers(prev => prev.filter(t => t.id !== id));
         playClick('soft');
       };
@@ -590,30 +1067,66 @@
           const osc = ctx.createOscillator();
           osc.connect(gain);
           const now = ctx.currentTime;
+          
           if (type === 'soft') {
             osc.type = 'sine';
-            osc.frequency.setValueAtTime(1200, now);
-            osc.frequency.exponentialRampToValueAtTime(800, now + 0.06);
-            gain.gain.setValueAtTime(vol * 0.15, now);
-            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.06);
-            osc.start(now);
-            osc.stop(now + 0.06);
+            osc.frequency.setValueAtTime(1000, now);
+            osc.frequency.exponentialRampToValueAtTime(800, now + 0.05);
+            gain.gain.setValueAtTime(vol * 0.1, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+            osc.start(now); osc.stop(now + 0.05);
           } else if (type === 'success') {
             osc.type = 'sine';
             osc.frequency.setValueAtTime(880, now);
-            osc.frequency.setValueAtTime(1100, now + 0.07);
-            gain.gain.setValueAtTime(vol * 0.18, now);
-            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.14);
-            osc.start(now);
-            osc.stop(now + 0.14);
+            osc.frequency.setValueAtTime(1174.66, now + 0.07);
+            gain.gain.setValueAtTime(vol * 0.15, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.15);
+            osc.start(now); osc.stop(now + 0.15);
+          } else if (type === 'error' || type === 'delete') {
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(440, now);
+            osc.frequency.exponentialRampToValueAtTime(330, now + 0.1);
+            gain.gain.setValueAtTime(vol * 0.12, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+            osc.start(now); osc.stop(now + 0.1);
+          } else if (type === 'switch-on') {
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(1400, now);
+            gain.gain.setValueAtTime(vol * 0.15, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+            osc.start(now); osc.stop(now + 0.05);
+          } else if (type === 'switch-off') {
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(950, now);
+            gain.gain.setValueAtTime(vol * 0.15, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.05);
+            osc.start(now); osc.stop(now + 0.05);
+          } else if (type === 'open' || type === 'pop') {
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(600, now);
+            osc.frequency.exponentialRampToValueAtTime(950, now + 0.12);
+            gain.gain.setValueAtTime(vol * 0.15, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+            osc.start(now); osc.stop(now + 0.12);
+          } else if (type === 'tick') {
+            osc.type = 'triangle';
+            osc.frequency.setValueAtTime(2200, now);
+            gain.gain.setValueAtTime(vol * 0.08, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.02);
+            osc.start(now); osc.stop(now + 0.02);
+          } else if (type === 'panjang') {
+            osc.type = 'sine';
+            osc.frequency.setValueAtTime(880, now);
+            gain.gain.setValueAtTime(vol * 0.2, now);
+            gain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
+            osc.start(now); osc.stop(now + 0.6);
           } else {
             osc.type = 'sine';
             osc.frequency.setValueAtTime(1000, now);
             osc.frequency.exponentialRampToValueAtTime(600, now + 0.04);
-            gain.gain.setValueAtTime(vol * 0.12, now);
+            gain.gain.setValueAtTime(vol * 0.1, now);
             gain.gain.exponentialRampToValueAtTime(0.001, now + 0.04);
-            osc.start(now);
-            osc.stop(now + 0.04);
+            osc.start(now); osc.stop(now + 0.04);
           }
         } catch (e) {}
       };
@@ -633,6 +1146,8 @@
       const [drawerOpen, setDrawerOpen] = useState(false);
       const [toastMsg, setToastMsg] = useState('');
       const [showSplash, setShowSplash] = useState(true);
+      const [settingsTab, setSettingsTab] = useState(null);
+      const [settingsSearch, setSettingsSearch] = useState('');
       const [newZone, setNewZone] = useState('');
       const [newTugas, setNewTugas] = useState('');
       const [newTugasDate, setNewTugasDate] = useState(() => { const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); });
@@ -649,6 +1164,15 @@
       const tugasPoleRefs  = useRef({});
       const tugasWaveRef   = useRef(null); // wave container div
 
+
+      // ── Sync notifications with OS on every app launch ──────────────
+      useEffect(() => {
+        // Small delay to ensure localStorage state (cookTimers, tugasItems) is loaded
+        const syncTimer = setTimeout(() => {
+          klipNotify.syncOnLaunch({ cookTimers, tugasItems });
+        }, 1500);
+        return () => clearTimeout(syncTimer);
+      }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
       useEffect(() => {
         const t = setTimeout(() => setShowSplash(false), 1600);
@@ -709,15 +1233,8 @@
                    changed = true;
                    toast(`Tenggat Waktu: ${t.text}`);
                    playClick('panjang');
-                   if (window.Notification && Notification.permission === 'granted') {
-                       if ('serviceWorker' in navigator && navigator.serviceWorker.ready) {
-                           navigator.serviceWorker.ready.then(reg => {
-                               reg.showNotification("Tenggat Tugas", { body: t.text, icon: './manifest.json' });
-                           }).catch(() => new Notification("Tenggat Tugas", { body: t.text }));
-                       } else {
-                           new Notification("Tenggat Tugas", { body: t.text });
-                       }
-                   }
+                   // Fire notification (Capacitor or Web fallback)
+                    klipNotify.fireNow({ title: 'Tenggat Tugas ⏰', body: t.text });
                    return { ...t, alarmed: true };
                 }
                 return t;
@@ -757,15 +1274,8 @@
                   setTimeout(() => playClick('success'), 1200);
                 }
                 toast(`Timer Selesai: ${t.title}`);
-                if (window.Notification && Notification.permission === 'granted') {
-                    if ('serviceWorker' in navigator && navigator.serviceWorker.ready) {
-                        navigator.serviceWorker.ready.then(reg => {
-                            reg.showNotification("Timer Selesai", { body: t.title, icon: './manifest.json' });
-                        }).catch(() => new Notification("Timer Selesai", { body: t.title }));
-                    } else {
-                        new Notification("Timer Selesai", { body: t.title });
-                    }
-                }
+                // Fire notification (Capacitor or Web fallback)
+                 klipNotify.fireNow({ title: 'Timer Selesai 🍳', body: t.title });
                 return { ...t, active: false };
               }
               return t;
@@ -788,9 +1298,98 @@
       }, [dialVisible, activeTab]);
 
 
+      /* ── Back Button Layering (Capacitor + PWA fallback) ── */
+      useEffect(() => {
+        // Shared logic: close topmost layer. Returns true if a layer was closed.
+        const handleBack = () => {
+          if (qrItem) {
+            setQrItem(null);
+            return true;
+          }
+          if (isGlobalOpen) {
+            setIsGlobalOpen(false);
+            playClick('soft');
+            return true;
+          }
+          if (cookActiveView !== 'list') {
+            if (cookActiveView === 'step') setCookActiveView('detail');
+            else setCookActiveView('list');
+            return true;
+          }
+          if (drawerOpen) {
+            if (snapDrawerRef.current) snapDrawerRef.current(false);
+            return true;
+          }
+          if (bubbleExpanded) {
+            setBubbleExpanded(false);
+            playClick('soft');
+            return true;
+          }
+          if (isDialOpen) {
+            setIsDialOpen(false);
+            return true;
+          }
+          return false; // no layer was open
+        };
+
+        // ── Tier 1: Capacitor Plugins.App (modern Capacitor 3+) ──
+        let capListener = null;
+        const Cap = window.Capacitor;
+        const AppPlugin = Cap?.Plugins?.App;
+        if (Cap && Cap.isNativePlatform && Cap.isNativePlatform() && AppPlugin) {
+          const listenerPromise = AppPlugin.addListener('backButton', () => {
+            const layerClosed = handleBack();
+            if (!layerClosed) {
+              AppPlugin.exitApp();
+            }
+          });
+          // addListener may return a promise (Capacitor 4+) or the listener directly
+          if (listenerPromise && typeof listenerPromise.then === 'function') {
+            listenerPromise.then(l => { capListener = l; });
+          } else {
+            capListener = listenerPromise;
+          }
+        }
+
+        // ── Tier 2: DOM-level Capacitor back events (some Capacitor versions) ──
+        // Capacitor bridges also fire 'ionBackButton' on the window object
+        const handleDomBack = (ev) => {
+          // Prevent default Capacitor behavior (which would exit app)
+          if (ev.detail && typeof ev.detail.register === 'function') {
+            ev.detail.register(100, (processNextHandler) => {
+              const layerClosed = handleBack();
+              if (!layerClosed) processNextHandler(); // pass to next (exit app)
+            });
+          } else {
+            const layerClosed = handleBack();
+            if (!layerClosed && AppPlugin) AppPlugin.exitApp();
+          }
+        };
+        window.addEventListener('ionBackButton', handleDomBack);
+
+        // ── PWA / Browser fallback (popstate) ──
+        history.replaceState({ klip: true }, '');
+        const handlePopState = () => {
+          const layerClosed = handleBack();
+          // Always re-push so next back press is also intercepted while layers exist
+          if (layerClosed) {
+            history.pushState({ klip: true }, '');
+          }
+          // If no layer → browser handles going back naturally (exits PWA on Android)
+        };
+        window.addEventListener('popstate', handlePopState);
+
+        return () => {
+          window.removeEventListener('popstate', handlePopState);
+          window.removeEventListener('ionBackButton', handleDomBack);
+          if (capListener && typeof capListener.remove === 'function') capListener.remove();
+        };
+      }, [qrItem, isGlobalOpen, cookActiveView, drawerOpen, bubbleExpanded, isDialOpen]);
+
       /* ── Drawer swipe engine ── */
       const drawerRef = useRef(null);
       const drag = useRef({ active:false, startY:0, startOpen:false, lastDy:0 });
+      const snapDrawerRef = useRef(null); // stable ref for back-button handler
 
       const snapDrawer = useCallback((toOpen) => {
         const el = drawerRef.current; if(!el) return;
@@ -798,9 +1397,11 @@
         el.style.height = (toOpen ? expandedH() : COLLAPSED_H) + 'px';
         el.style.transform = 'translateY(0)';
         setDrawerOpen(toOpen);
-        playClick('soft');
+        playClick(toOpen ? 'open' : 'soft');
         setTimeout(() => el && el.classList.remove('snapping'), 400);
       }, [haptics]);
+      // Keep ref in sync with latest snapDrawer
+      snapDrawerRef.current = snapDrawer;
 
       const onDragStart = (clientY) => {
         const el = drawerRef.current; if(!el) return;
@@ -1403,11 +2004,11 @@
                 <form onSubmit={handleSetup} className="space-y-3">
                   <div>
                     <label className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest mb-1 block">{tr('Buat PIN','Create PIN')}</label>
-                    <input type="password" inputMode="numeric" maxLength={6} placeholder="••••••" className={`w-full ${th.light} border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 text-center text-2xl tracking-[0.5em] font-black outline-none`} value={pinInput} onChange={e=>setPinInput(e.target.value.replace(/\D/g,''))}/>
+                    <input type="password" inputMode="numeric" maxLength={6} placeholder="••••••" className={`w-full ${th.light} border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 text-center text-2xl tracking-[0.5em] font-black outline-none`} value={pinInput} onChange={e=>{const v=e.target.value.replace(/\D/g,''); if(v.length>pinInput.length)playClick('tick'); setPinInput(v);}}/>
                   </div>
                   <div>
                     <label className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest mb-1 block">{tr('Konfirmasi PIN','Confirm PIN')}</label>
-                    <input type="password" inputMode="numeric" maxLength={6} placeholder="••••••" className={`w-full ${th.light} border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 text-center text-2xl tracking-[0.5em] font-black outline-none`} value={pinConfirm} onChange={e=>setPinConfirm(e.target.value.replace(/\D/g,''))}/>
+                    <input type="password" inputMode="numeric" maxLength={6} placeholder="••••••" className={`w-full ${th.light} border border-slate-200 dark:border-slate-700 rounded-xl px-4 py-3 text-center text-2xl tracking-[0.5em] font-black outline-none`} value={pinConfirm} onChange={e=>{const v=e.target.value.replace(/\D/g,''); if(v.length>pinConfirm.length)playClick('tick'); setPinConfirm(v);}}/>
                   </div>
                   {pinError && <p className="text-rose-500 text-xs font-bold text-center">{pinError}</p>}
                   <button type="submit" className={`w-full ${th.bg} text-white font-bold py-3.5 rounded-xl flex items-center justify-center gap-2 active:scale-[0.98] mt-2`}>
@@ -1442,7 +2043,7 @@
                 <h3 className="text-xl font-black text-slate-900 dark:text-white mb-1">{tr('Brankas Terkunci','Vault Locked')}</h3>
                 <p className="text-sm text-slate-400 mb-8">{tr('Masukkan PIN untuk membuka','Enter PIN to unlock')}</p>
                 <form onSubmit={handleUnlock} className="w-full space-y-3">
-                  <input type="password" inputMode="numeric" maxLength={6} placeholder="••••••" autoFocus className={`w-full ${th.light} border border-slate-200 dark:border-slate-700 rounded-2xl px-4 py-4 text-center text-3xl tracking-[0.6em] font-black outline-none`} value={pinInput} onChange={e=>setPinInput(e.target.value.replace(/\D/g,''))}/>
+                  <input type="password" inputMode="numeric" maxLength={6} placeholder="••••••" autoFocus className={`w-full ${th.light} border border-slate-200 dark:border-slate-700 rounded-2xl px-4 py-4 text-center text-3xl tracking-[0.6em] font-black outline-none`} value={pinInput} onChange={e=>{const v=e.target.value.replace(/\D/g,''); if(v.length>pinInput.length)playClick('tick'); setPinInput(v);}}/>
                   {pinError && <p className="text-rose-500 text-xs font-bold text-center">{pinError}</p>}
                   <button type="submit" className={`w-full ${th.bg} text-white font-bold py-3.5 rounded-xl flex items-center justify-center gap-2 active:scale-[0.98]`}>
                     <Unlock size={15}/> {tr('Buka Brankas','Unlock Vault')}
@@ -1542,7 +2143,7 @@
                       </div>
                       <div className="relative z-10 text-white">
                         <div className="flex items-center gap-3 mb-1">
-                          <p className={`font-mono text-xl font-black tracking-widest drop-shadow-md transition-all ${!isRev?'filter blur-[6px] opacity-70 select-none':''}`}>{isRev ? dispVal : '•••• •••• •••• ••••'}</p>
+                          <p className={`font-mono text-xl font-black tracking-widest drop-shadow-md transition-all`}>{isRev ? dispVal : '●●●● ●●●● ●●●● ●●●●'}</p>
                           {item.isPrivate&&<button onClick={()=>setRevealed(p=>({...p,[item.id]:!p[item.id]}))} className="text-white/70 hover:text-white">{isRev?<EyeOff size={16}/>:<Eye size={16}/>}</button>}
                         </div>
                         <div className="flex justify-between items-end mt-2">
@@ -1582,7 +2183,7 @@
                           </div>
                           <div className="flex-1 min-w-0">
                             <p className="font-black text-slate-900 dark:text-white text-sm truncate mb-0.5">{item.title}</p>
-                            <p className={`font-mono text-sky-500 text-xs truncate transition-all ${!isRev ? 'filter blur-[4px] select-none' : ''}`}>{isRev ? hostname : '••••••••'}</p>
+                            <p className={`font-mono text-sky-500 text-xs truncate transition-all`}>{isRev ? hostname : '●●●●●●●●'}</p>
                           </div>
                           {item.isPrivate && <button onClick={()=>setRevealed(p=>({...p,[item.id]:!p[item.id]}))} className="text-slate-400"><span>{isRev?<EyeOff size={13}/>:<Eye size={13}/>}</span></button>}
                         </div>
@@ -1626,7 +2227,7 @@
                               <p className="font-black text-slate-900 dark:text-white text-sm truncate">{item.title}</p>
                               {item.isEncrypted && <span className="text-[0.5rem] font-bold text-slate-400 border border-slate-200 dark:border-slate-700 px-1 rounded uppercase tracking-widest"><ShieldCheck size={7} className="inline mr-0.5"/> Enc</span>}
                             </div>
-                            <p className={`text-xs text-slate-500 dark:text-slate-400 mt-0.5 leading-snug transition-all ${!isRev ? 'filter blur-[4px] select-none' : ''}`}>{dispVal}</p>
+                            <p className={`text-xs text-slate-500 dark:text-slate-400 mt-0.5 leading-snug transition-all`}>{isRev ? dispVal : '●●●●●●●●●●●●●●●●'}</p>
                           </div>
                           {item.isPrivate && <button onClick={()=>setRevealed(p=>({...p,[item.id]:!p[item.id]}))} className="text-slate-400"><span>{isRev?<EyeOff size={13}/>:<Eye size={13}/>}</span></button>}
                         </div>
@@ -1676,11 +2277,11 @@
                           {item.isPrivate && <button onClick={()=>setRevealed(p=>({...p,[item.id]:!p[item.id]}))} className="text-slate-400"><span>{isRev?<EyeOff size={13}/>:<Eye size={13}/>}</span></button>}
                         </div>
                         
-                        <div className={`space-y-1 max-h-32 overflow-y-auto hide-scrollbar transition-all ${!isRev ? 'filter blur-[4px] select-none opacity-40' : ''}`}>
+                        <div className={`space-y-1 max-h-32 overflow-y-auto hide-scrollbar transition-all ${!isRev ? 'opacity-40' : ''}`}>
                           {lines.map((ln, i) => (
                             <div key={i} className="flex items-start gap-2 py-1 border-b border-slate-50 dark:border-slate-800 last:border-0">
                               <span className="text-orange-400 font-black text-xs mt-0.5">{i+1}.</span>
-                              <span className="text-[0.6875rem] text-slate-700 dark:text-slate-300 leading-snug">{ln}</span>
+                              <span className="text-[0.6875rem] text-slate-700 dark:text-slate-300 leading-snug">{isRev ? ln : '●●●●●●●●●●●●'}</span>
                             </div>
                           ))}
                         </div>
@@ -1728,7 +2329,7 @@
                             {!item.isEncrypted && <span className="flex-shrink-0 text-[0.5rem] font-black bg-orange-100 text-orange-500 px-1.5 py-0.5 rounded uppercase tracking-wide flex items-center gap-0.5"><ShieldOff size={7}/> Terbuka</span>}
                           </div>
                           <div className="flex items-center gap-2">
-                            <p className={`font-mono font-bold text-slate-800 dark:text-slate-200 text-sm truncate transition-all ${!isRev?'filter blur-[5px] select-none opacity-40':''}`}>{dispVal}</p>
+                            <p className={`font-mono font-bold text-slate-800 dark:text-slate-200 text-sm truncate transition-all`}>{isRev ? dispVal : '●'.repeat(Math.min(dispVal.length, 16))}</p>
                             {item.isPrivate&&<button onClick={()=>setRevealed(p=>({...p,[item.id]:!p[item.id]}))} className="text-slate-400 flex-shrink-0">{isRev?<EyeOff size={12}/>:<Eye size={12}/>}</button>}
                           </div>
                         </div>
@@ -1802,7 +2403,7 @@
                   <label className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest mb-2 block">Total Bon (Rp)</label>
                   <div className={`flex items-center ${th.light} border border-slate-200 dark:border-slate-700 rounded-2xl px-4 focus-within:border-slate-400`}>
                     <span className="text-slate-400 font-bold text-sm mr-1">Rp</span>
-                    <input type="text" inputMode="numeric" className="flex-1 bg-transparent py-3.5 text-xl font-black outline-none" placeholder="0" value={billAmt} onChange={e=>{const r=parse(e.target.value);setBillAmt(r?fmt(r):'');}}/>
+                    <input type="text" inputMode="numeric" className="flex-1 bg-transparent py-3.5 text-xl font-black outline-none" placeholder="0" value={billAmt} onChange={e=>{const r=parse(e.target.value); if(r && r.toString().length > (parse(billAmt)||'').toString().length) playClick('tick'); setBillAmt(r?fmt(r):'');}}/>
                   </div>
                 </div>
                 <div className="grid grid-cols-3 gap-3">
@@ -2125,7 +2726,7 @@
           <div className="space-y-4 pt-1">
             <label className="flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl cursor-pointer">
               <div><p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{tr('Rapikan Nomor Telepon', 'Format Phone Numbers')}</p><p className="text-[0.625rem] text-slate-400 mt-0.5">{tr('Hapus spasi dan tanda hubung', 'Remove spaces and dashes')}</p></div>
-              <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${autoClean ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>setAutoClean(a=>!a)}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${autoClean?'translate-x-6':'translate-x-1'}`}/></div>
+              <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${autoClean ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>{const n=!autoClean; setAutoClean(n); playClick(n?'switch-on':'switch-off'); }}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${autoClean?'translate-x-6':'translate-x-1'}`}/></div>
             </label>
             {isProMode&&extFilter==='all'&&(Object.values(ekstrakRes).reduce((s,a)=>s+a.length,0))>0&&(
               <div className="bg-amber-50 dark:bg-amber-900/10 border border-amber-200 dark:border-amber-500/20 p-4 rounded-xl space-y-2">
@@ -2172,9 +2773,9 @@
                     <p className="text-[0.625rem] text-slate-400">{newEncrypt ? tr('AES-256 — aman','AES-256 — secure') : tr('Tanpa enkripsi','No encryption')}</p>
                   </div>
                 </div>
-                <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${newEncrypt ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>setNewEncrypt(v=>!v)}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${newEncrypt?'translate-x-6':'translate-x-1'}`}/></div>
+                <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${newEncrypt ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>{const n=!newEncrypt; setNewEncrypt(n); playClick(n?'switch-on':'switch-off'); }}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${newEncrypt?'translate-x-6':'translate-x-1'}`}/></div>
               </label>
-              <button type="submit" className={`w-full ${th.bg} text-white font-bold py-3.5 rounded-xl flex items-center justify-center gap-2 active:scale-[0.98]`}><Plus size={16}/> tr('Simpan ke Brankas', 'Save to Vault')</button>
+              <button type="submit" className={`w-full ${th.bg} text-white font-bold py-3.5 rounded-xl flex items-center justify-center gap-2 active:scale-[0.98]`}><Plus size={16}/> {tr('Simpan ke Brankas', 'Save to Vault')}</button>
             </form>
           );
         }
@@ -2294,7 +2895,7 @@
                   <p className="font-bold text-amber-700 text-sm flex items-center gap-1"><Crown size={12}/> {tr('Mode Frasa', 'Passphrase Mode')}</p>
                   <p className="text-[0.625rem] text-amber-700/70 mt-0.5">{tr('kopi-senja-42 (mudah dihafal)', 'coffee-dusk-42 (easy to remember)')}</p>
                 </div>
-                <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${passph?'bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.3)]':'bg-amber-200 dark:bg-amber-500/40'}`} onClick={()=>setPassph(p=>!p)}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.1)] ${passph?'translate-x-6':'translate-x-1'}`}/></div>
+                <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${passph?'bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.3)]':'bg-amber-200 dark:bg-amber-500/40'}`} onClick={()=>{const n=!passph; setPassph(n); playClick(n?'switch-on':'switch-off');}}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.1)] ${passph?'translate-x-6':'translate-x-1'}`}/></div>
               </label>
             )}
             {sandiMode==='pwd'&&!passph&&(
@@ -2311,7 +2912,7 @@
                 </div>
                 <label className="flex items-center justify-between p-3.5 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl">
                   <p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{tr('Hindari Karakter Ambigu', 'Avoid Ambiguous Chars')}</p>
-                  <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${excAmbig ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>setExcAmbig(a=>!a)}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${excAmbig?'translate-x-6':'translate-x-1'}`}/></div>
+                  <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${excAmbig ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>{const n=!excAmbig; setExcAmbig(n); playClick(n?'switch-on':'switch-off');}}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${excAmbig?'translate-x-6':'translate-x-1'}`}/></div>
                 </label>
               </>
             )}
@@ -2344,7 +2945,7 @@
                 <p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{tr('Huruf Kapital HEX', 'Uppercase HEX')}</p>
                 <p className="text-[0.625rem] text-slate-400 mt-0.5">{tr('Salin HEX sebagai huruf besar', 'Copy HEX in uppercase')}</p>
               </div>
-              <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${hexUpper ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>setHexUpper(h=>!h)}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${hexUpper?'translate-x-6':'translate-x-1'}`}/></div>
+              <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${hexUpper ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>{const n=!hexUpper; setHexUpper(n); playClick(n?'switch-on':'switch-off');}}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${hexUpper?'translate-x-6':'translate-x-1'}`}/></div>
             </label>
 
             {/* Quick Color Presets */}
@@ -2396,12 +2997,114 @@
 
         if(activeTab==='masak') return(
           <div className="space-y-4 pt-1">
+            <div className="p-4 bg-orange-50 dark:bg-orange-500/10 border border-orange-200 dark:border-orange-500/20 rounded-2xl space-y-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="font-black text-orange-700 dark:text-orange-400 text-sm flex items-center gap-1.5"><Wand2 size={14}/> Resep Cepat</p>
+                  <p className="text-[0.625rem] text-orange-700/60 dark:text-orange-300/60 mt-0.5 leading-relaxed">Tempel resep dari luar, lalu Klip mengenali bahan, langkah, dan timer.</p>
+                </div>
+                {quickRecipeDraft&&<button onClick={()=>{setQuickRecipeDraft(null);setQuickRecipeWarnings([]);}} className="text-orange-500 active:scale-90"><X size={16}/></button>}
+              </div>
+
+              <textarea
+                value={quickRecipeText}
+                onChange={e=>setQuickRecipeText(e.target.value)}
+                placeholder="Tempel teks resep di sini..."
+                className="w-full h-28 bg-white dark:bg-slate-900 border border-orange-200 dark:border-orange-500/20 rounded-xl px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 outline-none resize-none placeholder:text-slate-400"
+              />
+              <div className="grid grid-cols-2 gap-2">
+                <button onClick={()=>{
+                  if(!quickRecipeText.trim()) return toast('Tempel resep dulu');
+                  const parsed = parseQuickRecipe(quickRecipeText);
+                  setQuickRecipeDraft(parsed.recipe);
+                  setQuickRecipeWarnings(parsed.warnings);
+                  toast(parsed.warnings.length ? 'Resep dikenali, perlu koreksi' : 'Resep dikenali');
+                  playClick('success');
+                }} className="py-3 bg-orange-500 text-white rounded-xl text-xs font-black flex items-center justify-center gap-1.5 active:scale-95"><Wand2 size={14}/> Kenali Resep</button>
+                <button onClick={()=>{setQuickRecipeText('');setQuickRecipeDraft(null);setQuickRecipeWarnings([]);playClick('soft');}} className="py-3 bg-white dark:bg-slate-900 border border-orange-200 dark:border-orange-500/20 text-orange-600 dark:text-orange-400 rounded-xl text-xs font-black active:scale-95">Bersihkan</button>
+              </div>
+
+              {quickRecipeDraft&&(
+                <div className="bg-white dark:bg-slate-900 border border-orange-200 dark:border-orange-500/20 rounded-2xl p-3 space-y-3 fade-in">
+                  {quickRecipeWarnings.length > 0 && (
+                    <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/20 rounded-xl px-3 py-2 text-[0.625rem] font-bold text-amber-700 dark:text-amber-400">
+                      Perlu koreksi manual: {quickRecipeWarnings.join(' ')}
+                    </div>
+                  )}
+                  <input value={quickRecipeDraft.title} onChange={e=>setQuickRecipeDraft(r=>({...r,title:e.target.value}))} className="w-full bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-sm font-black text-slate-800 dark:text-slate-200 outline-none" placeholder="Judul resep"/>
+                  <textarea value={quickRecipeDraft.desc} onChange={e=>setQuickRecipeDraft(r=>({...r,desc:e.target.value}))} className="w-full h-16 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-xs font-medium text-slate-700 dark:text-slate-300 outline-none resize-none" placeholder="Deskripsi"/>
+                  <div className="grid grid-cols-2 gap-2">
+                    <input type="number" min="1" value={quickRecipeDraft.defaultPortions} onChange={e=>setQuickRecipeDraft(r=>({...r,defaultPortions:Number(e.target.value)||1}))} className="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-xs font-bold text-slate-700 dark:text-slate-300 outline-none" placeholder="Porsi"/>
+                    <input value={quickRecipeDraft.tags.join(', ')} onChange={e=>setQuickRecipeDraft(r=>({...r,tags:e.target.value.split(',').map(x=>x.trim()).filter(Boolean)}))} className="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl px-3 py-2 text-xs font-bold text-slate-700 dark:text-slate-300 outline-none" placeholder="Tag"/>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-[0.625rem] font-black text-slate-400 uppercase tracking-widest">Bahan</p>
+                      <button onClick={()=>setQuickRecipeDraft(r=>({...r,ingredients:[...r.ingredients,{name:'',amount:1,unit:''}]}))} className="text-orange-500 active:scale-90"><Plus size={14}/></button>
+                    </div>
+                    <div className="space-y-2">
+                      {quickRecipeDraft.ingredients.map((ing,idx)=>(
+                        <div key={idx} className="grid grid-cols-[1fr_54px_58px_24px] gap-1.5">
+                          <input value={ing.name} onChange={e=>setQuickRecipeDraft(r=>{const ingredients=[...r.ingredients];ingredients[idx]={...ingredients[idx],name:e.target.value};return {...r,ingredients};})} className="min-w-0 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-2 text-[0.625rem] font-bold text-slate-700 dark:text-slate-300 outline-none" placeholder="Nama"/>
+                          <input type="number" value={ing.amount} onChange={e=>setQuickRecipeDraft(r=>{const ingredients=[...r.ingredients];ingredients[idx]={...ingredients[idx],amount:Number(e.target.value)||0};return {...r,ingredients};})} className="min-w-0 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-2 text-[0.625rem] font-bold text-slate-700 dark:text-slate-300 outline-none" placeholder="Jml"/>
+                          <input value={ing.unit} onChange={e=>setQuickRecipeDraft(r=>{const ingredients=[...r.ingredients];ingredients[idx]={...ingredients[idx],unit:e.target.value};return {...r,ingredients};})} className="min-w-0 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg px-2 py-2 text-[0.625rem] font-bold text-slate-700 dark:text-slate-300 outline-none" placeholder="Unit"/>
+                          <button onClick={()=>setQuickRecipeDraft(r=>({...r,ingredients:r.ingredients.filter((_,i)=>i!==idx)}))} className="text-rose-400 active:scale-90"><X size={13}/></button>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between mb-2">
+                      <p className="text-[0.625rem] font-black text-slate-400 uppercase tracking-widest">Langkah</p>
+                      <button onClick={()=>setQuickRecipeDraft(r=>({...r,steps:[...r.steps,{text:'',timerMs:0}]}))} className="text-orange-500 active:scale-90"><Plus size={14}/></button>
+                    </div>
+                    <div className="space-y-2">
+                      {quickRecipeDraft.steps.map((step,idx)=>(
+                        <div key={idx} className="bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-2">
+                          <div className="flex gap-2">
+                            <textarea value={step.text} onChange={e=>setQuickRecipeDraft(r=>{const steps=[...r.steps];steps[idx]={...steps[idx],text:e.target.value};return {...r,steps};})} className="flex-1 h-14 bg-transparent text-xs font-medium text-slate-700 dark:text-slate-300 outline-none resize-none" placeholder={`Langkah ${idx+1}`}/>
+                            <button onClick={()=>setQuickRecipeDraft(r=>({...r,steps:r.steps.filter((_,i)=>i!==idx)}))} className="text-rose-400 active:scale-90 self-start"><X size={13}/></button>
+                          </div>
+                          <div className="flex items-center gap-2 border-t border-slate-200 dark:border-slate-700 pt-1.5 mt-1">
+                            <Timer size={12} className="text-slate-400"/>
+                            <input type="number" min="0" value={step.timerMs ? Math.round(step.timerMs/60000) : ''} onChange={e=>setQuickRecipeDraft(r=>{const steps=[...r.steps];steps[idx]={...steps[idx],timerMs:(Number(e.target.value)||0)*60000};return {...r,steps};})} className="flex-1 bg-transparent text-[0.625rem] font-bold text-slate-700 dark:text-slate-300 outline-none" placeholder="Timer menit opsional"/>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button onClick={()=>{
+                    if(!quickRecipeDraft.title.trim()) return toast('Judul harus diisi');
+                    const recipe = {
+                      ...quickRecipeDraft,
+                      id: Date.now().toString(),
+                      ingredients: quickRecipeDraft.ingredients.filter(i=>i.name.trim()),
+                      steps: quickRecipeDraft.steps.filter(s=>s.text.trim())
+                    };
+                    setCookRecipes(p=>[recipe,...p]);
+                    setCookSelectedId(recipe.id);
+                    setCookPortion(recipe.defaultPortions || 4);
+                    setCookActiveView('detail');
+                    setQuickRecipeDraft(null);
+                    setQuickRecipeText('');
+                    setQuickRecipeWarnings([]);
+                    snapDrawer(false);
+                    toast('Resep cepat disimpan');
+                    playClick('success');
+                  }} className="w-full py-3 bg-orange-500 text-white rounded-xl text-xs font-black flex items-center justify-center gap-1.5 active:scale-95"><Download size={14}/> Simpan Resep</button>
+                </div>
+              )}
+            </div>
+
             <label className="flex items-center justify-between p-4 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl cursor-pointer">
               <div>
                 <p className="font-bold text-slate-700 dark:text-slate-300 text-sm">Penahan Layar Otomatis</p>
                 <p className="text-[0.625rem] text-slate-400 mt-0.5">Aktifkan saat mode masak layar penuh</p>
               </div>
-              <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${cookSettings.autoWakelock ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>setCookSettings(p=>({...p, autoWakelock:!p.autoWakelock}))}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${cookSettings.autoWakelock?'translate-x-6':'translate-x-1'}`}/></div>
+              <div className={`w-11 h-6 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${cookSettings.autoWakelock ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>{const n=!cookSettings.autoWakelock; setCookSettings(p=>({...p, autoWakelock:n})); playClick(n?'switch-on':'switch-off');}}><div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${cookSettings.autoWakelock?'translate-x-6':'translate-x-1'}`}/></div>
             </label>
             <div>
               <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-2.5">Durasi Suara Timer</p>
@@ -2730,13 +3433,11 @@
                     );
                   })()}
                 </div>
-                <div className="flex-shrink-0 ml-3 h-7 w-7 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-500 dark:text-slate-400 cursor-pointer hover:bg-slate-200"><ChevronUp size={15}/></div>
               </div>
             )}
             {drawerOpen&&(
               <div className="w-full flex items-center justify-between px-5 pb-2">
                 <span className="text-sm font-black text-slate-900 dark:text-white tracking-wide">Pengaturan {tabLabels[activeTab]}</span>
-                <div className="h-7 w-7 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-500 dark:text-slate-400" style={{transform:'rotate(180deg)'}}><ChevronUp size={15}/></div>
               </div>
             )}
           </div>
@@ -2805,7 +3506,7 @@
                 <div className={`flex items-center justify-between transition-opacity ${!isProMode?'opacity-50 grayscale':''}`}>
                   <div className="flex items-center gap-1.5"><span className="text-xs font-bold text-slate-500 uppercase tracking-widest">{tr('Warna Tengah', 'Middle Color')}</span>{!isProMode&&<Crown size={11} className="text-amber-500"/>}</div>
                   <div className="flex items-center gap-3">
-                    <div className={`w-14 h-8 rounded-full relative flex-shrink-0 transition-colors ${!isProMode?'cursor-default':'cursor-pointer'} ${gUse3 && isProMode ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>{if(isProMode) setGUse3(!gUse3);}}>
+                    <div className={`w-14 h-8 rounded-full relative flex-shrink-0 transition-colors ${!isProMode?'cursor-default':'cursor-pointer'} ${gUse3 && isProMode ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>{if(isProMode) { const n=!gUse3; setGUse3(n); playClick(n?'switch-on':'switch-off'); }}}>
                       <div className={`w-6 h-6 rounded-full absolute top-[4px] bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${gUse3 && isProMode ?'translate-x-7':'translate-x-1'}`}/>
                     </div>
                     <div className={`w-10 h-10 rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 ${!gUse3||!isProMode?'opacity-30 pointer-events-none':''}`}><input type="color" value={gColor3} onChange={e=>setGColor3(e.target.value)} disabled={!gUse3||!isProMode} className="w-[150%] h-[150%] -translate-x-[25%] -translate-y-[25%] cursor-pointer"/></div>
@@ -2852,11 +3553,20 @@
 
 
         const renderTimers = () => {
-            if(cookTimers.length === 0) return null;
+            const activeCookTimers = cookTimers.filter(t => t.active || t.paused);
+            if(activeCookTimers.length === 0) return null;
             return (
                 <div className="space-y-2 mb-6">
                     <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{tr('Timers Aktif', 'Active Timers')}</p>
-                    {cookTimers.map(t => <CookTimerItem key={t.id} t={t} setCookTimers={setCookTimers} />)}
+                    {activeCookTimers.map(t => (
+                      <CookTimerItem
+                        key={t.id}
+                        t={t}
+                        onPause={toggleTimerPause}
+                        onSkip={skipTimer}
+                        onCancel={endTimer}
+                      />
+                    ))}
                 </div>
             );
         };
@@ -2874,7 +3584,7 @@
             const step = r.steps[cookStepIdx];
             const isLast = cookStepIdx === r.steps.length - 1;
             return (
-                <div className="fixed inset-0 z-50 bg-[#FAFAFA] dark:bg-slate-950 flex flex-col sm:max-w-md sm:mx-auto pt-[env(safe-area-inset-top,2.5rem)] pb-[env(safe-area-inset-bottom,1.5rem)] px-6 slide-up overflow-hidden">
+                <div className={`fixed inset-0 z-50 bg-[#FAFAFA] dark:bg-slate-950 flex flex-col sm:max-w-md sm:mx-auto pt-[env(safe-area-inset-top,2.5rem)] pb-[env(safe-area-inset-bottom,1.5rem)] ${leftHanded ? 'pl-20 pr-6' : 'pl-6 pr-20'} slide-up overflow-hidden`}>
                    <div className="flex justify-between items-center mb-8">
                       <div className="flex items-center gap-2">
                          <button onClick={() => {setCookActiveView('detail'); releaseWakeLock();}} className="h-10 w-10 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-600 dark:text-slate-400 active:scale-90"><ArrowLeft size={18}/></button>
@@ -2897,7 +3607,11 @@
                                 <p className="font-bold text-amber-700 dark:text-amber-500 text-sm flex items-center gap-1.5"><Timer size={16}/> Mulai Timer {Math.round(step.timerMs/60000)}m</p>
                              </div>
                              <button onClick={() => {
-                                 setCookTimers(p => [...p, {id: Date.now().toString(), title: `L.${cookStepIdx+1}: ${r.title}`, durationMs: step.timerMs, endMs: Date.now() + step.timerMs, active: true}]);
+                                 const timerId = Date.now().toString();
+                                  const endMs = Date.now() + step.timerMs;
+                                  const timerTitle = `L.${cookStepIdx+1}: ${r.title}`;
+                                  setCookTimers(p => [...p, {id: timerId, title: timerTitle, durationMs: step.timerMs, endMs, active: true}]);
+                                  klipNotify.schedule({ id: 'cook_' + timerId, title: 'Timer Selesai 🍳', body: timerTitle, atMs: endMs });
                                  toast(tr('Timer dimulai!', 'Timer started!')); playClick('success');
                              }} className="h-14 w-14 bg-amber-500 text-white rounded-full flex items-center justify-center shadow-lg active:scale-90">
                                 <Play fill="currentColor" size={24} className="ml-1"/>
@@ -2908,7 +3622,7 @@
                       {renderTimers()}
                    </div>
                    
-                   <div className="flex gap-4 mt-auto pt-4 pb-[calc(env(safe-area-inset-bottom,0px)+1.5rem)] px-4 border-t border-slate-200 dark:border-slate-800 bg-[#FAFAFA] dark:bg-slate-950 relative z-[60] shrink-0">
+                   <div className="flex gap-4 mt-auto pt-4 pb-[calc(env(safe-area-inset-bottom,0px)+4.5rem)] px-4 border-t border-slate-200 dark:border-slate-800 bg-[#FAFAFA] dark:bg-slate-950 relative z-[60] shrink-0">
                       <button disabled={cookStepIdx === 0} onClick={() => setCookStepIdx(i => Math.max(0, i - 1))} className="h-16 w-16 bg-slate-200 dark:bg-slate-800 text-slate-700 dark:text-slate-300 rounded-2xl flex items-center justify-center disabled:opacity-30 active:scale-[0.98]">
                          <ArrowLeft size={24}/>
                       </button>
@@ -2949,7 +3663,7 @@
                     <button onClick={() => setCookActiveView('list')} className="h-10 w-10 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center text-slate-600 dark:text-slate-400 active:scale-90"><ArrowLeft size={18}/></button>
                     <div className="flex gap-2">
                        <button onClick={() => {
-                          const recipeText = `*Resep: ${r.title}*\n${r.desc}\n\n*Bahan (${cookPortion} porsi):*\n${r.ingredients.map(i => '- ' + (i.amount * sRatio).toPrecision(4).replace(/\.0+$/,'').replace(/(\.\d*?[1-9])0+$/,'$1') + ' ' + i.unit + ' ' + i.name).join('\n')}\n\n*Langkah:*\n${r.steps.map((s,i) => (i+1)+'. '+s.text).join('\n')}`;
+                          const recipeText = `*Resep: ${r.title}*\n${r.desc}\n\n*Bahan (${cookPortion} porsi):*\n${r.ingredients.map(i => '- ' + (() => { const f = formatCookAmount(i.amount * sRatio, i.unit); return f.amount + ' ' + f.unit + ' ' + i.name; })()).join('\n')}\n\n*Langkah:*\n${r.steps.map((s,i) => (i+1)+'. '+s.text).join('\n')}`;
                           saveToVault(recipeText, 'recipe');
                        }} className="h-10 px-4 bg-slate-100 dark:bg-slate-800 border-opacity-50 border border-slate-200 dark:border-slate-700 rounded-full flex items-center justify-center gap-1.5 text-slate-700 dark:text-slate-300 active:scale-90 transition-all font-bold text-[0.6875rem]" title={tr('Simpan ke Brankas', 'Save to Vault')}>
                           <CreditCard size={14}/>
@@ -2979,14 +3693,14 @@
                  <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-3xl p-5 shadow-sm space-y-5">
                     <div className="flex justify-between items-center">
                        <h3 className="font-bold text-slate-800 dark:text-slate-200 text-sm">{tr('Bahan-Bahan', 'Ingredients')}</h3>
-                       <span className={`font-mono font-bold text-xs ${th.text} ${th.light} px-2.5 py-1 rounded-md`}>{cookPortion} Porsi</span>
+                       <div className={`flex items-center gap-1 font-mono font-bold text-xs ${th.text} ${th.light} px-2 py-1 rounded-md`}><input type="number" min="1" value={cookPortion} onChange={e => setCookPortion(Number(e.target.value) || 1)} className="w-10 bg-transparent outline-none text-right font-black border-r border-current pr-1 mr-1" style={{color:"inherit"}} /> <span>Porsi</span></div>
                     </div>
-                    <input type="range" min="1" max="20" value={cookPortion} onChange={e => setCookPortion(Number(e.target.value))} className="w-full" style={{accentColor:th.hex}}/>
+                    <input type="range" min="1" max="100" value={cookPortion > 100 ? 100 : cookPortion} onChange={e => setCookPortion(Number(e.target.value))} className="w-full" style={{accentColor:th.hex}}/>
                     <ul className="space-y-3">
                        {r.ingredients.map((ing, i) => (
                            <li key={i} className="flex justify-between items-center border-b border-slate-100 dark:border-slate-800 pb-2.5 last:border-0 last:pb-0">
                                <span className="text-sm font-semibold text-slate-700 dark:text-slate-300 capitalize flex items-center gap-2"><div className="w-1.5 h-1.5 rounded-full bg-slate-300 dark:bg-slate-600"/>{ing.name}</span>
-                               <span className={`font-mono font-black text-sm ${th.text}`}>{(ing.amount * sRatio).toPrecision(4).replace(/\.0+$/,'').replace(/(\.\d*?[1-9])0+$/,'$1')} <span className="text-slate-400 font-medium">{ing.unit}</span></span>
+                               <span className={`font-mono font-black text-sm ${th.text}`}>{(() => { const f = formatCookAmount(ing.amount * sRatio, ing.unit); return <>{f.amount} <span className="text-slate-400 font-medium">{f.unit}</span></>; })()}</span>
                            </li>
                        ))}
                     </ul>
@@ -3152,409 +3866,172 @@
         );
       };
 
-      /* ════════════════════════════════════
+                  /* ════════════════════════════════════
          GLOBAL SETTINGS
       ═════════════════════════════════════ */
       const renderGlobal = () => {
         if(!isGlobalOpen) return null;
-        return(
+        const q = settingsSearch.toLowerCase().trim();
+
+        // ── Helpers ────────────────────
+        const Tog = ({on,fn})=>(<div className={`w-14 h-8 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${on?th.toggleOn:'bg-slate-200 dark:bg-slate-700'}`} onClick={fn}><div className={`w-6 h-6 rounded-full absolute top-[4px] bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${on?'translate-x-7':'translate-x-1'}`}/></div>);
+        const Seg = ({opts,val,fn})=>(<div className="flex bg-slate-100 dark:bg-slate-800 rounded-xl p-1 gap-1">{opts.map(([v,l])=>(<button key={v} onClick={()=>fn(v)} className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all ${val===v?'bg-white dark:bg-slate-700 shadow-sm text-slate-900 dark:text-white':'text-slate-500 dark:text-slate-400'}`}>{l}</button>))}</div>);
+        const SRow = ({icon,color,label,desc,right,onClick})=>(<button onClick={onClick} className="w-full flex items-center gap-4 px-4 py-3.5 active:bg-slate-50 dark:active:bg-slate-800/50 transition-colors text-left"><div className={`h-9 w-9 rounded-xl flex items-center justify-center flex-shrink-0`} style={{backgroundColor:color+'18'}}>{React.cloneElement(icon,{size:18,color:color,strokeWidth:2.2})}</div><div className="flex-1 min-w-0"><p className="font-bold text-[0.8125rem] text-slate-800 dark:text-slate-200 leading-tight">{label}</p>{desc&&<p className="text-[0.625rem] text-slate-400 mt-0.5 leading-snug">{desc}</p>}</div>{right||<ChevronDown size={15} className="text-slate-300 dark:text-slate-600 -rotate-90 flex-shrink-0"/>}</button>);
+        const SubHeader = ({title,onBack})=>(<div className="px-5 pt-10 pb-4 flex items-center gap-3 border-b border-slate-100 dark:border-slate-800 flex-shrink-0"><button onClick={onBack} className="h-9 w-9 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center active:scale-90 flex-shrink-0"><ArrowLeft size={17} className="text-slate-600 dark:text-slate-400"/></button><h3 className="text-lg font-black text-slate-900 dark:text-white">{title}</h3></div>);
+
+        // ── Category config ──────────
+        const categories = [
+          {id:'tampilan', icon:<Palette/>,   color:'#f59e0b', label:t('tampil'),   desc:tr('Warna, tema gelap, ukuran font','Color, dark mode, font size')},
+          {id:'suara',    icon:<Volume2/>,   color:'#ef4444', label:tr('Suara & Getaran','Sound & Vibration'),desc:tr('Efek suara, volume, animasi','Sound effects, volume, animation')},
+          {id:'navigasi', icon:<Hand/>,      color:'#3b82f6', label:tr('Navigasi & Tata Letak','Navigation & Layout'), desc:tr('Tab awal, mode kidal, Klip Bubble','Startup tab, left-hand, Klip Bubble')},
+          {id:'bahasa',   icon:<Globe/>,     color:'#10b981', label:t('bhs'),      desc:tr('Indonesia / English','Indonesia / English')},
+          ...(isProMode?[{id:'dial',icon:<Settings2/>,color:'#8b5cf6',label:t('kustomDial'),desc:tr('Urutan & visibilitas tab Dial','Order & visibility of Dial tabs')}]:[]),
+          {id:'premium',  icon:<Crown/>,     color:'#f59e0b', label:t('prem'),     desc:isProMode?t('aktif'):t('buka')},
+          ...(masterPinSet?[{id:'keamanan',icon:<ShieldAlert/>,color:'#ef4444',label:tr('Keamanan','Security'),desc:tr('Hapus data Brankas','Wipe Vault data')}]:[]),
+        ];
+
+        // ── Search ───────────────────
+        const SEARCH_ITEMS = [
+          {id:'theme',cat:'tampilan',label:t('warna'),keys:'tema warna aksen color accent indigo emerald rose violet slate'},
+          {id:'dark',cat:'tampilan',label:t('gelap'),keys:'gelap dark mode malam night'},
+          {id:'font',cat:'tampilan',label:t('font'),keys:'font ukuran teks size kecil besar'},
+          {id:'haptics',cat:'suara',label:t('haptics'),keys:'suara efek haptics sound beep bunyi'},
+          {id:'volume',cat:'suara',label:t('sfx_vol'),keys:'volume keras pelan loud'},
+          {id:'motion',cat:'suara',label:t('motion'),keys:'animasi motion gerak transisi speed'},
+          {id:'startup',cat:'navigasi',label:t('start_tab'),keys:'halaman startup awal utama tab buka'},
+          {id:'kidal',cat:'navigasi',label:t('kidal'),keys:'kidal kiri left handed tangan'},
+          {id:'bubble',cat:'navigasi',label:'Klip Bubble',keys:'bubble posisi notch kamera lebar width'},
+          {id:'lang',cat:'bahasa',label:t('bhs'),keys:'bahasa language indonesia english'},
+          {id:'dial',cat:'dial',label:t('kustomDial'),keys:'dial kustomisasi menu urutan sembunyikan'},
+          {id:'premium',cat:'premium',label:t('prem'),keys:'pro premium fitur unlock buka'},
+          ...(masterPinSet?[{id:'wipe',cat:'keamanan',label:tr('Hapus Brankas','Wipe Vault'),keys:'hapus wipe vault brankas reset pin'}]:[]),
+        ];
+        const matchIds = q ? SEARCH_ITEMS.filter(i=>i.keys.includes(q)||i.label.toLowerCase().includes(q)) : null;
+
+        // ── Sub-pages (detail views) ─────────────────────────────
+        const goBack = ()=>{setSettingsTab(null);playClick('soft');};
+
+        const pgTampilan = (<div className="space-y-4">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4">
+            <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest mb-3">{t('warna')}</p>
+            <div className="flex gap-3 flex-wrap">{Object.keys(THEMES).map(k=>{const lk=!isProMode&&k!=='slate';const sw={slate:'bg-slate-800',indigo:'bg-indigo-600',emerald:'bg-emerald-500',rose:'bg-rose-500',violet:'bg-violet-600'};return(<button key={k} onClick={()=>{if(lk){toast('Tema eksklusif Pro!');return;}setActiveTheme(k);playClick('soft');}} className={`relative h-10 w-10 rounded-full flex items-center justify-center ${sw[k]} ${activeTheme===k?'ring-4 ring-offset-2 scale-110 '+THEMES[k].border:''} ${lk?'opacity-50 grayscale':''} transition-all`}>{activeTheme===k&&<Check size={16} className="text-white"/>}{lk&&<Crown size={11} className="absolute text-white/90"/>}</button>);})}</div>
+          </div>
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4">
+            <div className="flex justify-between items-center"><div><p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{t('gelap')}</p><p className="text-[0.625rem] text-slate-400 mt-0.5">{t('gelap_desc')}</p></div><Tog on={darkMode} fn={()=>{const n=!darkMode;setDarkMode(n);playClick(n?'switch-on':'switch-off');}}/></div>
+          </div>
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4">
+            <p className="font-bold text-slate-700 dark:text-slate-300 text-sm mb-3">{t('font')}</p>
+            <Seg opts={[['small',t('kecil')],['normal',t('standar')],['large',t('besar')]]} val={fontSize} fn={v=>{setFontSize(v);playClick('soft');}}/>
+          </div>
+        </div>);
+
+        const pgSuara = (<div className="space-y-4">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4 space-y-3">
+            <div className="flex justify-between items-center"><div><p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{t('haptics')}</p><p className="text-[0.625rem] text-slate-400 mt-0.5">{t('haptics_desc')}</p></div><Tog on={haptics} fn={()=>{const n=!haptics;setHaptics(n);playClick(n?'switch-on':'switch-off');if(n)setTimeout(()=>playClick('success'),150);}}/></div>
+            {haptics&&<div><div className="flex justify-between mb-1.5"><p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{t('sfx_vol')}</p><span className="text-[0.625rem] font-bold text-slate-500">{Math.round(soundVol*100)}%</span></div><input type="range" min="0" max="1" step="0.05" value={soundVol} onChange={e=>setSoundVol(parseFloat(e.target.value))} onMouseUp={()=>playClick('soft')} onTouchEnd={()=>playClick('soft')} className="w-full" style={{accentColor:th.hex}}/></div>}
+          </div>
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4">
+            <p className="font-bold text-slate-700 dark:text-slate-300 text-sm mb-1">{t('motion')}</p>
+            <p className="text-[0.625rem] text-slate-400 mb-3">{t('motion_desc')}</p>
+            <Seg opts={[['default',t('m_default')],['fast',t('m_fast')],['none',t('m_reduce')]]} val={reduceMotion} fn={v=>{setReduceMotion(v);playClick('soft');}}/>
+          </div>
+        </div>);
+
+        const pgNavigasi = (<div className="space-y-4">
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4">
+            <p className="font-bold text-slate-700 dark:text-slate-300 text-sm mb-1">{t('start_tab')}</p>
+            <p className="text-[0.625rem] text-slate-400 mb-3">{t('start_tab_desc')}</p>
+            <div className="flex flex-wrap gap-1.5">{['ekstrak','brankas','draft','hitung','sandi','warna','bersih','masak','tugas'].map(v=>(<button key={v} onClick={()=>{setStartupTab(v);setActiveTab(v);playClick('soft');}} className={`px-3 py-1.5 rounded-lg text-[0.6875rem] font-bold transition-all ${startupTab===v?th.bg+' text-white shadow-sm':'bg-slate-100 dark:bg-slate-800 text-slate-500 dark:text-slate-400'}`}>{DIAL_CONFIG[v].label}</button>))}</div>
+          </div>
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4">
+            <div className="flex justify-between items-center"><div><p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{t('kidal')}</p><p className="text-[0.625rem] text-slate-400 mt-0.5">{t('kidal_desc')}</p></div><Tog on={leftHanded} fn={()=>{const n=!leftHanded;setLeftHanded(n);playClick(n?'switch-on':'switch-off');}}/></div>
+          </div>
+          <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4 space-y-4">
+            <div><p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{t('bubble_utils')}</p><p className="text-[0.625rem] text-slate-400 mt-0.5 mb-3">{t('bubble_utils_desc')}</p>
+            <div className="space-y-2">{[[tr('Catat Cepat (Draf)','Quick Draft'),bubbleDraft,setBubbleDraft],[tr('Ekstrak Cepat','Quick Extract'),bubbleExtrak,setBubbleExtrak]].map(([lbl,val,set])=>(<label key={lbl} className="flex items-center gap-3 cursor-pointer" onClick={()=>{set(!val);playClick('soft');}}><div className={`w-5 h-5 rounded flex items-center justify-center transition-all ${val?'bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900':'bg-slate-200 dark:bg-slate-700 text-transparent'}`}><Check size={12} strokeWidth={3}/></div><span className="text-xs font-bold text-slate-600 dark:text-slate-300">{lbl}</span></label>))}</div></div>
+            <div className="border-t border-slate-100 dark:border-slate-800 pt-4 space-y-4">
+              {[[tr('Posisi Vertikal','Vertical Pos.'),bubbleTopOffset,setBubbleTopOffset,0,120,1,'px'],[tr('Lebar Idle','Idle Width'),bubbleIdleWidth,setBubbleIdleWidth,60,200,2,'px'],[tr('Lebar Timer','Timer Width'),bubbleTimerWidth,setBubbleTimerWidth,80,300,2,'px']].map(([lbl,val,set,mn,mx,st,u])=>(<div key={lbl}><div className="flex justify-between mb-1.5"><p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{lbl}</p><span className="text-[0.625rem] font-bold text-slate-500">{val}{u}</span></div><input type="range" min={mn} max={mx} step={st} value={val} onChange={e=>{set(parseInt(e.target.value));playClick('soft');}} className="w-full h-1.5 appearance-none cursor-pointer" style={{accentColor:th.hex}}/></div>))}
+            </div>
+          </div>
+        </div>);
+
+        const pgBahasa = (<div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4">
+          <div className="flex bg-slate-100 dark:bg-slate-800 p-1 rounded-xl gap-1">{[['id','🇮🇩 Indonesia'],['en','🇬🇧 English']].map(([v,l])=>(<button key={v} onClick={()=>{setLanguage(v);playClick('soft');}} className={`flex-1 py-2.5 rounded-lg text-sm font-bold transition-all ${language===v?'bg-white dark:bg-slate-700 shadow-sm text-slate-900 dark:text-white':'text-slate-500 dark:text-slate-400'}`}>{l}</button>))}</div>
+        </div>);
+
+        const pgDial = isProMode && (<div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm p-4">
+          <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest mb-4">{t('kustomDesc')}</p>
+          <div className="space-y-2.5">
+            {dialVisible.map((id,idx)=>{const conf=DIAL_CONFIG[id];if(!conf)return null;const mandatory=id==='brankas'||id==='bersih'||id==='tugas';const isDragging=draggedDialItem===idx,isDragOver=dragOverDialItem===idx;return(<div key={id} data-dial-idx={idx} className={`flex items-center justify-between px-3 py-2 rounded-xl transition-all ${isDragging?'opacity-60 border-2 border-dashed border-slate-400 bg-slate-100 dark:bg-slate-800':'bg-slate-50 dark:bg-slate-800/50 border border-slate-100 dark:border-slate-700'} ${isDragOver&&draggedDialItem!==null&&draggedDialItem!==idx?(draggedDialItem<idx?'border-b-4 border-b-emerald-500':'border-t-4 border-t-emerald-500'):''}`}><div className="flex items-center gap-3"><button style={{touchAction:'none'}} className="text-slate-400 cursor-grab px-1 py-2" onPointerDown={e=>{setDraggedDialItem(idx);e.target.setPointerCapture(e.pointerId);playClick('soft');}} onPointerMove={e=>{if(draggedDialItem===null)return;const el=document.elementFromPoint(e.clientX,e.clientY)?.closest('[data-dial-idx]');if(el){const di=Number(el.getAttribute('data-dial-idx'));if(di!==dragOverDialItem){setDragOverDialItem(di);playClick('soft');}}}} onPointerUp={e=>{if(draggedDialItem!==null&&dragOverDialItem!==null&&draggedDialItem!==dragOverDialItem){const a=[...dialVisible];const d=a.splice(draggedDialItem,1)[0];a.splice(dragOverDialItem,0,d);setDialVisible(a);}setDraggedDialItem(null);setDragOverDialItem(null);e.target.releasePointerCapture(e.pointerId);}} onPointerCancel={e=>{setDraggedDialItem(null);setDragOverDialItem(null);e.target.releasePointerCapture(e.pointerId);}}><GripVertical size={16}/></button><div className="h-8 w-8 bg-slate-100 dark:bg-slate-700 rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-300">{React.cloneElement(conf.icon,{size:15})}</div><span className="font-bold text-slate-700 dark:text-slate-300 text-sm">{conf.label}</span>{conf.pro&&<Crown size={11} className="text-amber-500"/>}</div>{mandatory?<div className="w-11 h-6 rounded-full bg-slate-200 dark:bg-slate-700 opacity-50 relative flex-shrink-0"><div className="w-4 h-4 rounded-full absolute top-1 bg-white translate-x-6"/></div>:<div className={`w-11 h-6 rounded-full relative cursor-pointer flex-shrink-0 ${th.toggleOn}`} onClick={()=>setDialVisible(dialVisible.filter(v=>v!==id))}><div className="w-4 h-4 rounded-full absolute top-1 bg-white translate-x-6"/></div>}</div>);})}
+            {Object.keys(DIAL_CONFIG).filter(id=>!dialVisible.includes(id)).map(id=>{const conf=DIAL_CONFIG[id];return(<div key={id} className="flex items-center justify-between px-3 py-2 rounded-xl border border-slate-100 dark:border-slate-700 opacity-50"><div className="flex items-center gap-3"><div className="h-8 w-8 bg-slate-100 dark:bg-slate-700 rounded-lg flex items-center justify-center">{React.cloneElement(conf.icon,{size:15})}</div><span className="font-bold text-slate-500 text-sm line-through">{conf.label}</span></div><div className="w-11 h-6 rounded-full relative cursor-pointer bg-slate-200 dark:bg-slate-700 flex-shrink-0" onClick={()=>setDialVisible([...dialVisible,id])}><div className="w-4 h-4 rounded-full absolute top-1 bg-white translate-x-1"/></div></div>);})}
+          </div>
+        </div>);
+
+        const pgPremium = (<div className={`p-5 rounded-2xl border transition-all ${isProMode?'bg-amber-50 border-amber-300 dark:bg-amber-500/10 dark:border-amber-500/30':'bg-white dark:bg-slate-900 border-slate-100 dark:border-slate-800 shadow-sm'}`}>
+          <div className="flex justify-between items-center mb-4"><div><h4 className={`text-base font-black ${isProMode?'text-amber-600 dark:text-amber-400':'text-slate-800 dark:text-slate-200'}`}>Klip Pro</h4><p className="text-xs text-slate-500 mt-0.5">{isProMode?t('aktif'):t('buka')}</p></div><Tog on={isProMode} fn={()=>{const n=!isProMode;setIsProMode(n);playClick(n?'switch-on':'switch-off');}}/></div>
+          <ul className="space-y-2">{[[tr('Ekstrak: Scanner + Brankas','Extract: Scanner + Vault'),Scan],[tr('Draf: Sensor + Format WA','Draft: Censor + WA Format'),Type],[tr('Hitung: Struk + Preset','Calc: Receipt + Templates'),Calculator],[tr('Sandi: Frasa + Riwayat','Password: Phrase + History'),KeyRound],[tr('Brankas: Catatan Enkripsi','Vault: Encrypted Notes'),CreditCard],[tr('Warna: Gradien 3 Titik','Color: 3-Point Gradient'),Palette],[tr('Tema: 4 Warna Premium','Themes: 4 Premium Colors'),Crown],[tr('Kustomisasi Dial','Dial Customization'),Settings2]].map(([f,Icon])=>(<li key={f} className="flex gap-2 items-center"><div className={`h-5 w-5 rounded-md flex items-center justify-center flex-shrink-0 ${isProMode?'bg-amber-100 dark:bg-amber-500/20':'bg-slate-100 dark:bg-slate-800'}`}><Icon size={11} className={isProMode?'text-amber-600 dark:text-amber-400':'text-slate-400'}/></div><span className="text-xs font-semibold text-slate-700 dark:text-slate-300">{f}</span></li>))}</ul>
+        </div>);
+
+        const pgKeamanan = masterPinSet && (<div className="bg-rose-50 dark:bg-rose-500/5 border border-rose-200 dark:border-rose-500/20 p-5 rounded-2xl">
+          {wipeStep===0&&<><p className="text-sm font-bold text-rose-600 dark:text-rose-400 mb-1">{tr('Hapus Seluruh Data Brankas','Wipe All Vault Data')}</p><p className="text-[0.6875rem] text-rose-500/70 leading-relaxed mb-4">{tr('Menghapus semua item di Brankas secara permanen. PIN juga akan direset.','Permanently deletes all Vault items and resets PIN.')}</p><button onClick={()=>setWipeStep(1)} className="w-full bg-rose-500 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 active:scale-95"><Trash2 size={14}/> {tr('Hapus Data','Delete Data')}</button></>}
+          {wipeStep===1&&<div className="space-y-3 fade-in"><p className="text-sm font-bold text-rose-600 dark:text-rose-400">{tr('Verifikasi PIN','Verify PIN')}</p><input type="password" inputMode="numeric" maxLength={6} placeholder="••••••" className="w-full bg-white dark:bg-slate-900 border border-rose-300 dark:border-rose-500/30 rounded-xl px-4 py-3 text-center text-2xl tracking-[0.5em] font-black outline-none text-rose-600" value={wipePin} onChange={e=>{const v=e.target.value.replace(/\D/g,'');if(v.length>wipePin.length)playClick('tick');setWipePin(v);}} autoFocus/><div className="flex gap-2"><button onClick={()=>{setWipeStep(0);setWipePin('');}} className="flex-1 bg-slate-100 dark:bg-slate-800 text-slate-600 font-bold py-3 rounded-xl active:scale-95">{tr('Batal','Cancel')}</button><button onClick={async()=>{const s=localStorage.getItem('klip_vault_pin_hash');const a=await hashPin(wipePin);if(a===s){setWipeStep(2);}else{toast(tr('PIN salah!','Wrong PIN!'));setWipePin('');}}} disabled={wipePin.length<4} className="flex-1 bg-rose-500 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-1.5 active:scale-95 disabled:opacity-40"><Lock size={13}/> {tr('Verifikasi','Verify')}</button></div></div>}
+          {wipeStep===2&&<div className="space-y-3 fade-in text-center"><div className="h-14 w-14 bg-rose-100 dark:bg-rose-500/20 rounded-2xl flex items-center justify-center mx-auto"><Trash2 size={28} className="text-rose-500"/></div><p className="text-sm font-black text-rose-600 dark:text-rose-400">{tr('Anda yakin?','Sure?')}</p><p className="text-[0.6875rem] text-rose-500/70 leading-relaxed">{`${vaultItems.length} ${tr('item dihapus permanen.','items permanently deleted.')}`}</p><div className="flex gap-2"><button onClick={()=>{setWipeStep(0);setWipePin('');}} className="flex-1 bg-slate-100 dark:bg-slate-800 text-slate-600 font-bold py-3 rounded-xl active:scale-95">{tr('Batal','Cancel')}</button><button onClick={()=>{localStorage.removeItem('klip_vault_pin_hash');sessionStorage.removeItem('klip_vault_session_pin');setMasterPinSet(false);setVaultLocked(true);setDecryptedVals({});setRevealed({});setVaultItems([]);setWipeStep(0);setWipePin('');toast(tr('Data Brankas dihapus.','Vault data deleted.'));}} className="flex-1 bg-rose-600 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-1.5 active:scale-95"><Trash2 size={13}/> {tr('Hapus','Delete')}</button></div></div>}
+        </div>);
+
+        const pages = {tampilan:pgTampilan,suara:pgSuara,navigasi:pgNavigasi,bahasa:pgBahasa,dial:pgDial,premium:pgPremium,keamanan:pgKeamanan};
+        const pageTitles = {tampilan:t('tampil'),suara:tr('Suara & Getaran','Sound & Vibration'),navigasi:tr('Navigasi','Navigation'),bahasa:t('bhs'),dial:t('kustomDial'),premium:t('prem'),keamanan:tr('Keamanan','Security')};
+
+        // ── Main return ──────────────────────────────────────────
+        return (
           <div className="absolute inset-0 z-[100] bg-[#FAFAFA] dark:bg-[#0c0f1a] flex flex-col slide-up">
-            <div className="px-6 pt-10 pb-4 flex justify-between items-center border-b border-slate-100 dark:border-slate-800">
-              <h2 className="text-2xl font-black text-slate-900 dark:text-white">{t('peng')}</h2>
-              <button onClick={()=>{setIsGlobalOpen(false); playClick('soft');}} className="h-10 w-10 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center active:scale-90"><X size={19} className="text-slate-600 dark:text-slate-400"/></button>
-            </div>
-            <div className="flex-1 overflow-y-auto px-6 py-6 space-y-8 hide-scrollbar">
-              <section>
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2"><Palette size={14}/> {t('tampil')}</h3>
-                <div className="space-y-3">
-                  <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-xl border border-slate-100 dark:border-slate-700">
-                    <p className="text-sm font-bold text-slate-700 dark:text-slate-300 mb-3">{t('warna')}</p>
-                    <div className="flex gap-4">
-                      {Object.keys(THEMES).map(k=>{
-                        const isLocked = !isProMode && k !== 'slate';
-                        const swatches={slate:'bg-slate-800 border-2 border-transparent dark:border-slate-600',indigo:'bg-indigo-600 border-2 border-transparent',emerald:'bg-emerald-500 border-2 border-transparent',rose:'bg-rose-500 border-2 border-transparent',violet:'bg-violet-600 border-2 border-transparent'};
-                        return (
-                        <button key={k} onClick={()=>{if(isLocked){toast('Tema eksklusif Pro!');return;}setActiveTheme(k)}} className={`relative h-11 w-11 rounded-full flex items-center justify-center ${swatches[k]} ${activeTheme===k?'ring-4 ring-offset-2 scale-110 '+THEMES[k].border:''} ${isLocked?'opacity-50 grayscale':''}`}>
-                          {activeTheme===k&&<Check size={18} className="text-white"/>}
-                          {isLocked&&<Crown size={12} className="absolute text-white/90 drop-shadow flex-shrink-0"/>}
-                        </button>
-                      )})}
-                    </div>
+            {settingsTab ? (
+              <>
+                <SubHeader title={pageTitles[settingsTab]} onBack={goBack}/>
+                <div className="flex-1 overflow-y-auto px-5 py-5 hide-scrollbar">{pages[settingsTab]}</div>
+              </>
+            ) : (
+              <>
+                <div className="px-5 pt-10 pb-3 flex-shrink-0">
+                  <div className="flex justify-between items-center mb-4">
+                    <h2 className="text-xl font-black text-slate-900 dark:text-white">{t('peng')}</h2>
+                    <button onClick={()=>{setIsGlobalOpen(false);setSettingsSearch('');playClick('soft');}} className="h-10 w-10 bg-slate-100 dark:bg-slate-800 rounded-full flex items-center justify-center active:scale-90"><X size={19} className="text-slate-600 dark:text-slate-400"/></button>
                   </div>
-                  
-                  <div className="flex justify-between items-center bg-slate-50 dark:bg-slate-800 p-4 rounded-xl border border-slate-100 dark:border-slate-700">
-                    <div>
-                      <p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{t('gelap')}</p>
-                      <p className="text-[0.625rem] text-slate-400 mt-0.5">{t('gelap_desc')}</p>
-                    </div>
-                    <div className={`w-14 h-8 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${darkMode ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>setDarkMode(!darkMode)}>
-                      <div className={`w-6 h-6 rounded-full absolute top-[4px] bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${darkMode ? 'translate-x-7' : 'translate-x-1'}`}/>
-                    </div>
-                  </div>
-
-                  <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-xl border border-slate-100 dark:border-slate-700">
-                    <p className="font-bold text-slate-700 dark:text-slate-300 text-sm mb-3">{t('font')}</p>
-                    <div className="flex bg-slate-200 dark:bg-slate-700/50 rounded-lg p-1 gap-1">
-                      {[['small',t('kecil')],['normal',t('standar')],['large',t('besar')]].map(([v,l])=>(
-                        <button key={v} onClick={()=>setFontSize(v)} className={`flex-1 py-1.5 rounded-md text-xs font-bold transition-all ${fontSize===v?'bg-white dark:bg-slate-900 shadow-sm text-slate-900 dark:text-white':'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'}`}>{l}</button>
-                      ))}
-                    </div>
+                  <div className="relative">
+                    <Search size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none"/>
+                    <input type="text" placeholder={tr('Cari opsi pengaturan','Search settings')} value={settingsSearch} onChange={e=>setSettingsSearch(e.target.value)} className="w-full bg-slate-100 dark:bg-slate-800 rounded-2xl pl-10 pr-10 py-3 text-sm font-medium text-slate-700 dark:text-slate-300 outline-none placeholder:text-slate-400 border border-transparent focus:border-slate-300 dark:focus:border-slate-600 transition-colors"/>
+                    {settingsSearch&&<button onClick={()=>setSettingsSearch('')} className="absolute right-3.5 top-1/2 -translate-y-1/2 text-slate-400 active:scale-90"><X size={15}/></button>}
                   </div>
                 </div>
-              </section>
-
-              <div className="h-px bg-slate-200 dark:bg-slate-800"/>
-
-              <section>
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2"><Volume2 size={14}/> {t('person')}</h3>
-                <div className="space-y-3">
-                  <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-xl border border-slate-100 dark:border-slate-700 space-y-3">
-                    <div className="flex justify-between items-center">
-                      <div>
-                        <p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{t('haptics')}</p>
-                        <p className="text-[0.625rem] text-slate-400 mt-0.5">{t('haptics_desc')}</p>
+                <div className="flex-1 overflow-y-auto px-5 py-3 hide-scrollbar">
+                  {q ? (
+                    matchIds.length===0 ? (
+                      <div className="text-center py-20"><Search size={36} className="text-slate-300 dark:text-slate-600 mx-auto mb-3"/><p className="text-sm font-bold text-slate-400">{tr('Tidak ditemukan','No results')}</p><p className="text-xs text-slate-400 mt-1">"{settingsSearch}"</p></div>
+                    ) : (
+                      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm overflow-hidden divide-y divide-slate-100 dark:divide-slate-800">
+                        {matchIds.map(item=>{const cat=categories.find(c=>c.id===item.cat);return(<SRow key={item.id} icon={cat?.icon||<Search/>} color={cat?.color||'#94a3b8'} label={item.label} desc={cat?.label} onClick={()=>{setSettingsSearch('');setSettingsTab(item.cat);playClick('soft');}}/>);})}
                       </div>
-                      <div className={`w-14 h-8 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${haptics ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>{const next=!haptics; setHaptics(next); if(next) setTimeout(()=>playClick('success'),50);}}>
-                        <div className={`w-6 h-6 rounded-full absolute top-[4px] bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${haptics ? 'translate-x-7' : 'translate-x-1'}`}/>
+                    )
+                  ) : (
+                    <div className="space-y-4">
+                      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm overflow-hidden divide-y divide-slate-100 dark:divide-slate-800">
+                        {categories.filter(c=>['tampilan','suara','navigasi'].includes(c.id)).map(c=>(<SRow key={c.id} icon={c.icon} color={c.color} label={c.label} desc={c.desc} onClick={()=>{setSettingsTab(c.id);playClick('soft');}}/>))}
+                      </div>
+                      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm overflow-hidden divide-y divide-slate-100 dark:divide-slate-800">
+                        {categories.filter(c=>['bahasa','dial'].includes(c.id)).map(c=>(<SRow key={c.id} icon={c.icon} color={c.color} label={c.label} desc={c.desc} onClick={()=>{setSettingsTab(c.id);playClick('soft');}}/>))}
+                      </div>
+                      <div className="bg-white dark:bg-slate-900 rounded-2xl border border-slate-100 dark:border-slate-800 shadow-sm overflow-hidden divide-y divide-slate-100 dark:divide-slate-800">
+                        {categories.filter(c=>['premium','keamanan'].includes(c.id)).map(c=>(<SRow key={c.id} icon={c.icon} color={c.color} label={c.label} desc={c.desc} onClick={()=>{setSettingsTab(c.id);playClick('soft');}}/>))}
                       </div>
                     </div>
-                    {haptics && (
-                      <div>
-                        <div className="flex justify-between items-center mb-1.5">
-                          <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{t('sfx_vol')}</p>
-                          <span className="text-[0.625rem] font-bold text-slate-500 dark:text-slate-400">{Math.round(soundVol*100)}%</span>
-                        </div>
-                        <input type="range" min="0" max="1" step="0.05" value={soundVol} onChange={e=>setSoundVol(parseFloat(e.target.value))} onMouseUp={()=>playClick('soft')} onTouchEnd={()=>playClick('soft')} className="w-full" style={{accentColor:th.hex}}/>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-xl border border-slate-100 dark:border-slate-700">
-                    <p className="font-bold text-slate-700 dark:text-slate-300 text-sm mb-3">{t('motion')}</p>
-                    <div className="flex bg-slate-200 dark:bg-slate-700/50 rounded-lg p-1 gap-1">
-                      {[['default',t('m_default')],['fast',t('m_fast')],['none',t('m_reduce')]].map(([v,l])=>(
-                        <button key={v} onClick={()=>{setReduceMotion(v); playClick('soft');}} className={`flex-1 py-1.5 rounded-md text-xs font-bold transition-all ${reduceMotion===v?'bg-white dark:bg-slate-900 shadow-sm text-slate-900 dark:text-white':'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'}`}>{l}</button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-xl border border-slate-100 dark:border-slate-700">
-                    <p className="font-bold text-slate-700 dark:text-slate-300 text-sm mb-3">{t('start_tab')}</p>
-                    <div className="flex flex-wrap bg-slate-200 dark:bg-slate-700/50 rounded-lg p-1 gap-1">
-                      {['ekstrak','brankas','draft','hitung','sandi','warna','bersih','masak','tugas'].map((v)=>(
-                        <button key={v} onClick={()=>{setStartupTab(v); setActiveTab(v); playClick('soft');}} className={`px-2 flex-1 py-1.5 rounded-md text-[0.6875rem] font-bold transition-all uppercase tracking-wider ${startupTab===v?'bg-white dark:bg-slate-900 shadow-sm text-slate-900 dark:text-white':'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'}`}>{DIAL_CONFIG[v].label}</button>
-                      ))}
-                    </div>
-                  </div>
+                  )}
                 </div>
-                  
-                  <div className="bg-slate-50 dark:bg-slate-800 p-4 rounded-xl border border-slate-100 dark:border-slate-700 mt-4">
-                    <p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{t('bubble_utils')}</p>
-                    <p className="text-[0.625rem] text-slate-400 mt-0.5 mb-3">{t('bubble_utils_desc')}</p>
-                    <div className="flex flex-col gap-3">
-                      <label className="flex items-center gap-3 cursor-pointer group">
-                        <input type="checkbox" checked={bubbleDraft} onChange={(e) => { setBubbleDraft(e.target.checked); playClick('soft'); }} className="hidden"/>
-                        <div className={"w-5 h-5 rounded flex items-center justify-center transition-all " + (bubbleDraft ? "bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900" : "bg-slate-200 dark:bg-slate-700 text-transparent")}>
-                          <Check size={12} strokeWidth={3}/>
-                        </div>
-                        <span className="text-xs font-bold text-slate-600 dark:text-slate-300 group-hover:text-slate-900 dark:group-hover:text-white transition-colors">{tr('Catat Cepat (Draf)','Quick Draft')}</span>
-                      </label>
-                      <label className="flex items-center gap-3 cursor-pointer group">
-                        <input type="checkbox" checked={bubbleExtrak} onChange={(e) => { setBubbleExtrak(e.target.checked); playClick('soft'); }} className="hidden"/>
-                        <div className={"w-5 h-5 rounded flex items-center justify-center transition-all " + (bubbleExtrak ? "bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900" : "bg-slate-200 dark:bg-slate-700 text-transparent")}>
-                          <Check size={12} strokeWidth={3}/>
-                        </div>
-                        <span className="text-xs font-bold text-slate-600 dark:text-slate-300 group-hover:text-slate-900 dark:group-hover:text-white transition-colors">{tr('Ekstrak Cepat','Quick Extract')}</span>
-                      </label>
-                    </div>
-
-                    <div className="mt-4 pt-4 border-t border-slate-200/50 dark:border-slate-700/50">
-                      <div className="flex justify-between items-center mb-1.5">
-                        <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{tr('Posisi Vertikal','Vertical Position')}</p>
-                        <span className="text-[0.625rem] font-bold text-slate-500 dark:text-slate-400">{bubbleTopOffset}px</span>
-                      </div>
-                      <input 
-                        type="range" 
-                        min="0" 
-                        max="120" 
-                        step="1" 
-                        value={bubbleTopOffset} 
-                        onChange={e => { setBubbleTopOffset(parseInt(e.target.value)); playClick('soft'); }} 
-                        className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer" 
-                        style={{ accentColor: th.hex }}
-                      />
-                      <p className="text-[0.5rem] text-slate-400 mt-1.5 leading-relaxed">{tr('Sesuaikan agar Klip Bubble pas dengan kamera/notch HP Anda.','Adjust Klip Bubble to match your phone\'s camera or notch.')}</p>
-                    </div>
-
-                    <div className="mt-4 pt-4 border-t border-slate-200/50 dark:border-slate-700/50 space-y-4">
-                      <div>
-                        <div className="flex justify-between items-center mb-1.5">
-                          <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{tr('Lebar Mode Idle','Idle Width')}</p>
-                          <span className="text-[0.625rem] font-bold text-slate-500 dark:text-slate-400">{bubbleIdleWidth}px</span>
-                        </div>
-                        <input 
-                          type="range" min="60" max="200" step="2" value={bubbleIdleWidth} 
-                          onChange={e => { setBubbleIdleWidth(parseInt(e.target.value)); playClick('soft'); }} 
-                          className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer" 
-                          style={{ accentColor: th.hex }}
-                        />
-                      </div>
-                      <div>
-                        <div className="flex justify-between items-center mb-1.5">
-                          <p className="text-[0.625rem] font-bold text-slate-400 uppercase tracking-widest">{tr('Lebar Mode Timer','Timer Width')}</p>
-                          <span className="text-[0.625rem] font-bold text-slate-500 dark:text-slate-400">{bubbleTimerWidth}px</span>
-                        </div>
-                        <input 
-                          type="range" min="80" max="300" step="2" value={bubbleTimerWidth} 
-                          onChange={e => { setBubbleTimerWidth(parseInt(e.target.value)); playClick('soft'); }} 
-                          className="w-full h-1.5 bg-slate-200 dark:bg-slate-700 rounded-lg appearance-none cursor-pointer" 
-                          style={{ accentColor: th.hex }}
-                        />
-                      </div>
-                    </div>
-                  </div>
-              </section>
-
-              <div className="h-px bg-slate-200 dark:bg-slate-800"/>
-
-              <section>
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2"><Hand size={14}/> {t('akses')}</h3>
-                <div className="flex justify-between items-center bg-slate-50 dark:bg-slate-800 p-4 rounded-xl border border-slate-100 dark:border-slate-700">
-                  <div>
-                    <p className="font-bold text-slate-700 dark:text-slate-300 text-sm">{t('kidal')}</p>
-                    <p className="text-[0.625rem] text-slate-400 mt-0.5">{t('kidal_desc')}</p>
-                  </div>
-                  <div className={`w-14 h-8 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${leftHanded ? th.toggleOn : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>setLeftHanded(!leftHanded)}>
-                    <div className={`w-6 h-6 rounded-full absolute top-[4px] bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] ${leftHanded ? 'translate-x-7' : 'translate-x-1'}`}/>
-                  </div>
-                </div>
-              </section>
-
-              <div className="h-px bg-slate-200 dark:bg-slate-800"/>
-
-              {isProMode && (
-                <>
-                  <section>
-                    <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2">
-                      <Settings2 size={14}/> {t('kustomDial')} <Crown size={12} className="text-amber-500 ml-1"/>
-                    </h3>
-                    <div className="space-y-4 relative">
-                      {dialVisible.map((id, idx) => {
-                        const conf = DIAL_CONFIG[id];
-                        if(!conf) return null;
-                        const isMandatory = id === 'brankas' || id === 'bersih' || id === 'tugas';
-
-                        const isDragging = draggedDialItem === idx;
-                        const isDragOver = dragOverDialItem === idx;
-
-                        return (
-                          <div key={id} data-dial-idx={idx} className={`flex items-center justify-between px-3 py-2 rounded-xl transition-all duration-300 ${isDragging ? 'opacity-60 scale-[0.98] border-2 border-dashed border-slate-400 dark:border-slate-500 bg-slate-100 dark:bg-slate-800 shadow-inner z-10' : 'bg-white dark:bg-slate-900 border border-slate-100 dark:border-slate-800 shadow-sm'} ${isDragOver && draggedDialItem !== null && draggedDialItem !== idx ? (draggedDialItem < idx ? 'border-b-4 border-b-emerald-500 bg-emerald-50/50 dark:bg-emerald-500/10' : 'border-t-4 border-t-emerald-500 bg-emerald-50/50 dark:bg-emerald-500/10') : ''}`}>
-                            <div className="flex items-center gap-3">
-                              <button 
-                                 style={{ touchAction: 'none' }}
-                                 className="text-slate-400 hover:text-slate-600 dark:hover:text-slate-300 active:text-slate-800 cursor-grab active:cursor-grabbing px-1 py-2"
-                                 onPointerDown={(e) => {
-                                     setDraggedDialItem(idx);
-                                     e.target.setPointerCapture(e.pointerId);
-                                     playClick('soft');
-                                 }}
-                                 onPointerMove={(e) => {
-                                     if (draggedDialItem === null) return;
-                                     const target = document.elementFromPoint(e.clientX, e.clientY);
-                                     const dropTarget = target?.closest('[data-dial-idx]');
-                                     if (dropTarget) {
-                                         const dropIdx = Number(dropTarget.getAttribute('data-dial-idx'));
-                                         if (dropIdx !== dragOverDialItem) {
-                                             setDragOverDialItem(dropIdx);
-                                             playClick('soft');
-                                         }
-                                     }
-                                 }}
-                                 onPointerUp={(e) => {
-                                     if (draggedDialItem !== null && dragOverDialItem !== null && draggedDialItem !== dragOverDialItem) {
-                                         const newItems = [...dialVisible];
-                                         const dragged = newItems.splice(draggedDialItem, 1)[0];
-                                         newItems.splice(dragOverDialItem, 0, dragged);
-                                         setDialVisible(newItems);
-                                     }
-                                     setDraggedDialItem(null);
-                                     setDragOverDialItem(null);
-                                     e.target.releasePointerCapture(e.pointerId);
-                                 }}
-                                 onPointerCancel={(e) => {
-                                     setDraggedDialItem(null);
-                                     setDragOverDialItem(null);
-                                     e.target.releasePointerCapture(e.pointerId);
-                                 }}
-                              >
-                                 <GripVertical size={16}/>
-                              </button>
-                              <div className="h-9 w-9 bg-slate-100 dark:bg-slate-800 rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-300">
-                                {React.cloneElement(conf.icon, {size: 16})}
-                              </div>
-                              <span className="font-bold text-slate-700 dark:text-slate-300 text-sm">{conf.label}</span>
-                              {conf.pro && <Crown size={12} className="text-amber-500 ml-1"/>}
-                            </div>
-                            <div className="flex items-center gap-2">
-                              {!isMandatory ? (
-                                <div className={`w-12 h-6 ml-2 rounded-full relative flex-shrink-0 cursor-pointer transition-colors ${th.toggleOn}`} onClick={() => setDialVisible(dialVisible.filter(v => v !== id))}>
-                                  <div className={`w-4 h-4 rounded-full absolute top-1 bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.15)] translate-x-7`}/>
-                                </div>
-                              ) : (
-                                <div className="w-12 h-6 ml-2 rounded-full relative flex-shrink-0 bg-slate-200 dark:bg-slate-700 opacity-60">
-                                   <div className="w-4 h-4 rounded-full absolute top-1 bg-white translate-x-7 shadow-[0_1px_3px_rgba(0,0,0,0.15)]"/>
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      })}
-
-                      {Object.keys(DIAL_CONFIG).filter(id => !dialVisible.includes(id)).map(id => {
-                         const conf = DIAL_CONFIG[id];
-                         return (
-                          <div key={id} className="flex items-center justify-between px-3 py-2 rounded-xl border border-slate-100 dark:border-slate-800 opacity-50 blur-[0.4px] hover:blur-none hover:opacity-100 transition-all">
-                            <div className="flex items-center gap-3">
-                              <div className="h-9 w-9 bg-slate-100 dark:bg-slate-800 rounded-lg flex items-center justify-center text-slate-600 dark:text-slate-300">
-                                {React.cloneElement(conf.icon, {size: 16})}
-                              </div>
-                              <span className="font-bold text-slate-500 dark:text-slate-400 text-sm line-through">{conf.label}</span>
-                            </div>
-                            <div className={`w-12 h-6 ml-2 rounded-full relative flex-shrink-0 cursor-pointer bg-slate-200 dark:bg-slate-700 transition-all`} onClick={() => setDialVisible([...dialVisible, id])}>
-                               <div className={`w-4 h-4 rounded-full absolute top-1 bg-white shadow-[0_1px_3px_rgba(0,0,0,0.15)] translate-x-1`}/>
-                            </div>
-                          </div>
-                         );
-                      })}
-                    </div>
-                  </section>
-
-                  <div className="h-px bg-slate-200 dark:bg-slate-800"/>
-                </>
-              )}
-
-              <section>
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2"><Globe size={14}/> {t('bhs')}</h3>
-                <div className="flex bg-slate-50 dark:bg-slate-800 p-1 rounded-xl border border-slate-100 dark:border-slate-700 gap-1">
-                  {[['id','🇮🇩 Indonesia'],['en','🇬🇧 English']].map(([v,l])=>(
-                    <button key={v} onClick={()=>setLanguage(v)} className={`flex-1 py-2.5 rounded-lg text-sm font-bold transition-all ${language===v?'bg-white dark:bg-slate-900 shadow-sm text-slate-900 dark:text-white ring-1 ring-slate-200 dark:ring-slate-700':'text-slate-500 dark:text-slate-400 hover:text-slate-700 dark:hover:text-slate-300'}`}>{l}</button>
-                  ))}
-                </div>
-              </section>
-
-              <div className="h-px bg-slate-200 dark:bg-slate-800"/>
-
-              <section>
-                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4 flex items-center gap-2"><Crown size={14} className="text-amber-500"/> {t('prem')}</h3>
-                <div className={`p-6 rounded-3xl border transition-all duration-500 ${isProMode?'bg-amber-50 border-amber-300 dark:bg-amber-500/10 dark:border-amber-500/30':'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700'}`}>
-                  <div className="flex justify-between items-start mb-5">
-                    <div>
-                      <h4 className={`text-lg font-black tracking-tight ${isProMode?'text-amber-600 dark:text-amber-500':'text-slate-800 dark:text-slate-200'}`}>Klip Pro</h4>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">{isProMode?t('aktif'):t('buka')}</p>
-                    </div>
-                    <div className={`w-14 h-8 rounded-full relative flex-shrink-0 cursor-pointer transition-colors mt-1 ${isProMode ? 'bg-amber-500 shadow-[0_0_12px_rgba(245,158,11,0.25)]' : 'bg-slate-200 dark:bg-slate-700'}`} onClick={()=>setIsProMode(m=>!m)}>
-                      <div className={`w-6 h-6 rounded-full absolute top-[4px] bg-white transition-transform shadow-[0_1px_3px_rgba(0,0,0,0.1)] ${isProMode ? 'translate-x-7' : 'translate-x-1'}`}/>
-                    </div>
-                  </div>
-                  <ul className="space-y-2.5">
-                    {[
-                      [language==='en'?'Extract: Scanner + Save to Vault':'Ekstrak: Scanner + ' + tr('Simpan ke Brankas', 'Save to Vault'), Scan],
-                      [language==='en'?'Draft: Auto Censor + WA Format':'Draf: Sensor Otomatis + Format WA', Type],
-                      [language==='en'?'Calculate: Receipt Export + Templates':'Hitung: Struk ASCII + Preset Cepat', Calculator],
-                      [language==='en'?'Password: Passphrase + History':'Sandi: Mode Frasa + Riwayat Sandi', KeyRound],
-                      [language==='en'?'Vault: Encrypted Notes per Item':'Brankas: Catatan Rahasia Terenkripsi', CreditCard],
-                      [language==='en'?'Color: 3-Point Gradient + Save Palette':'Warna: Gradien 3 Titik + Simpan Palet', Palette],
-                      [language==='en'?'Themes: 4 Premium Accent Colors':'Tema: 4 Warna Aksen Premium', Crown],
-                      [language==='en'?'Dial Customization: Hide/Show Tabs':'Kustomisasi Dial: Sembunyikan Tab', Settings2],
-                    ].map(([f, Icon])=>(
-                      <li key={f} className="flex gap-2.5 items-center"><div className={`h-5 w-5 rounded-md flex items-center justify-center flex-shrink-0 ${isProMode?'bg-amber-100 dark:bg-amber-500/20':'bg-slate-200 dark:bg-slate-700'}`}><Icon size={11} className={isProMode?'text-amber-600 dark:text-amber-400':'text-slate-400'}/></div><span className="text-sm font-semibold text-slate-700 dark:text-slate-300">{f}</span></li>
-                    ))}
-                  </ul>
-
-                  {/* Selengkapnya / More about it */}
-                  <details className="mt-5 group">
-                    <summary className={`text-xs font-bold cursor-pointer select-none flex items-center gap-1.5 ${isProMode?'text-amber-600 dark:text-amber-400':'text-slate-500 dark:text-slate-400'}`}>
-                      <ChevronUp size={13} className="rotate-180 group-open:rotate-0 transition-transform"/>
-                      {tr('Selengkapnya tentang Pro', 'More about Pro')}
-                    </summary>
-                    <div className={`mt-4 space-y-3.5 text-xs leading-relaxed ${isProMode?'text-amber-700/80 dark:text-amber-300/70':'text-slate-500 dark:text-slate-400'}`}>
-                      <div className="flex gap-2"><Scan size={13} className="flex-shrink-0 mt-0.5"/><p><strong>Ekstrak</strong> — {tr('Langsung kirim nomor telepon & rekening bank yang terdeteksi ke Brankas. Ekspor semua data ke format CSV.','Send detected phone numbers & bank accounts directly to Vault. Export all data to CSV format.')}</p></div>
-                      <div className="flex gap-2"><Type size={13} className="flex-shrink-0 mt-0.5"/><p><strong>Draf</strong> — {tr('Mode sensor otomatis menyembunyikan kata kasar. Format teks ke gaya WhatsApp (bold, italic, strikethrough).','Auto-censor mode hides bad words. Format text to WhatsApp style (bold, italic, strikethrough).')}</p></div>
-                      <div className="flex gap-2"><Calculator size={13} className="flex-shrink-0 mt-0.5"/><p><strong>Hitung</strong> — {tr('Salin struk split-bill dalam format ASCII. Tambahkan info rekening bank di struk ekspor.','Copy split-bill receipt in ASCII format. Add bank account info to exported receipt.')}</p></div>
-                      <div className="flex gap-2"><KeyRound size={13} className="flex-shrink-0 mt-0.5"/><p><strong>Sandi</strong> — {tr('Mode frasa menghasilkan password mudah dihafal (misal: kopi-senja-42). Riwayat 10 password terakhir.','Passphrase mode generates memorable passwords (e.g. coffee-dusk-42). History of last 10 passwords.')}</p></div>
-                      <div className="flex gap-2"><CreditCard size={13} className="flex-shrink-0 mt-0.5"/><p><strong>Brankas</strong> — {tr('Setiap item bisa memiliki catatan rahasia terenkripsi yang hanya terlihat setelah membuka kunci.','Each item can have encrypted private notes only visible after unlocking.')}</p></div>
-                      <div className="flex gap-2"><Palette size={13} className="flex-shrink-0 mt-0.5"/><p><strong>{t('tab6')}</strong> — {tr('Simpan palet warna ke Brankas. Buat gradien CSS 3 titik warna. Ekspor gradien untuk koleksi.','Save color palettes to Vault. Create 3-point CSS gradients. Export gradients for collection.')}</p></div>
-                      <div className="flex gap-2"><Crown size={13} className="flex-shrink-0 mt-0.5"/><p><strong>{tr('Tema','Themes')}</strong> — {tr('Buka 4 warna aksen premium: Indigo, Emerald, Rose selain Slate bawaan.','Unlock 4 premium accent colors: Indigo, Emerald, Rose in addition to default Slate.')}</p></div>
-                      <div className="flex gap-2"><Settings2 size={13} className="flex-shrink-0 mt-0.5"/><p><strong>{t('kustomDial')}</strong> — {tr('Pilih utilitas mana saja yang tampil di Dial Menu. Sembunyikan yang tidak diperlukan.','Choose which utilities appear on the Dial Menu. Hide the ones you don\'t need.')}</p></div>
-                    </div>
-                  </details>
-                </div>
-              </section>
-
-              <div className="h-px bg-slate-200 dark:bg-slate-800"/>
-
-              {/* Danger Zone: Wipe Vault */}
-              {masterPinSet && (
-                <section>
-                  <h3 className="text-xs font-bold text-rose-400 uppercase tracking-widest mb-4 flex items-center gap-2"><Trash2 size={14}/> {tr('Zona Berbahaya', 'Danger Zone')}</h3>
-                  <div className="bg-rose-50 dark:bg-rose-500/5 border border-rose-200 dark:border-rose-500/20 p-5 rounded-2xl">
-                    {wipeStep === 0 && (
-                      <>
-                        <p className="text-sm font-bold text-rose-600 dark:text-rose-400 mb-1">{tr('Hapus Seluruh Data Brankas', 'Wipe All Vault Data')}</p>
-                        <p className="text-[0.6875rem] text-rose-500/70 dark:text-rose-400/60 leading-relaxed mb-4">{tr('Menghapus semua item yang tersimpan di Brankas secara permanen. PIN Brankas juga akan direset. Tindakan ini tidak dapat dibatalkan.', 'Permanently delete all items stored in the Vault. Vault PIN will also be reset. This action cannot be undone.')}</p>
-                        <button onClick={()=>setWipeStep(1)} className="w-full bg-rose-500 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-2 active:scale-95"><Trash2 size={14}/> {tr('Hapus Data Brankas', 'Delete Vault Data')}</button>
-                      </>
-                    )}
-                    {wipeStep === 1 && (
-                      <div className="space-y-3 fade-in">
-                        <p className="text-sm font-bold text-rose-600 dark:text-rose-400 mb-1">{tr('Verifikasi PIN Anda', 'Verify Your PIN')}</p>
-                        <p className="text-[0.6875rem] text-rose-500/70 dark:text-rose-400/60 leading-relaxed">{tr('Masukkan PIN Brankas Anda untuk mengkonfirmasi penghapusan.', 'Enter your Vault PIN to confirm deletion.')}</p>
-                        <input type="password" inputMode="numeric" maxLength={6} placeholder="••••••" className="w-full bg-white dark:bg-slate-900 border border-rose-300 dark:border-rose-500/30 rounded-xl px-4 py-3 text-center text-2xl tracking-[0.5em] font-black outline-none text-rose-600" value={wipePin} onChange={e=>setWipePin(e.target.value.replace(/\D/g,''))} autoFocus/>
-                        <div className="flex gap-2">
-                          <button onClick={()=>{setWipeStep(0);setWipePin('');}} className="flex-1 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-bold py-3 rounded-xl active:scale-95">{tr('Batal', 'Cancel')}</button>
-                          <button onClick={async()=>{
-                            const stored = localStorage.getItem('klip_vault_pin_hash');
-                            const attempt = await hashPin(wipePin);
-                            if(attempt === stored) {
-                              setWipeStep(2);
-                            } else {
-                              toast(tr('PIN salah!', 'Wrong PIN!')); setWipePin('');
-                            }
-                          }} disabled={wipePin.length < 4} className="flex-1 bg-rose-500 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-1.5 active:scale-95 disabled:opacity-40"><Lock size={13}/> {tr('Verifikasi', 'Verify')}</button>
-                        </div>
-                      </div>
-                    )}
-                    {wipeStep === 2 && (
-                      <div className="space-y-3 fade-in text-center">
-                        <div className="h-14 w-14 bg-rose-100 dark:bg-rose-500/20 rounded-2xl flex items-center justify-center mx-auto"><Trash2 size={28} className="text-rose-500"/></div>
-                        <p className="text-sm font-black text-rose-600 dark:text-rose-400">{tr('Anda yakin?', 'Are you sure?')}</p>
-                        <p className="text-[0.6875rem] text-rose-500/70 leading-relaxed">{tr(`${vaultItems.length} item akan dihapus permanen dan PIN akan direset.`, `${vaultItems.length} items will be permanently deleted and PIN akan direset.`)}</p>
-                        <div className="flex gap-2">
-                          <button onClick={()=>{setWipeStep(0);setWipePin('');}} className="flex-1 bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400 font-bold py-3 rounded-xl active:scale-95">{tr('Batal', 'Cancel')}</button>
-                          <button onClick={()=>{
-                            localStorage.removeItem('klip_vault_pin_hash');
-                            sessionStorage.removeItem('klip_vault_session_pin');
-                            setMasterPinSet(false);
-                            setVaultLocked(true);
-                            setDecryptedVals({});
-                            setRevealed({});
-                            setVaultItems([]);
-                            setWipeStep(0);
-                            setWipePin('');
-                            toast(tr('Semua data Brankas dihapus.', 'All Vault data deleted.'));
-                          }} className="flex-1 bg-rose-600 text-white font-bold py-3 rounded-xl flex items-center justify-center gap-1.5 active:scale-95">
-                            <Trash2 size={13}/> {tr('Hapus Semua', 'Delete All')}
-                          </button>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                </section>
-              )}
-            </div>
+              </>
+            )}
           </div>
         );
       };
+
+
 
       /* ════════════════════════════════════
          TUGAS UTILITY
@@ -3578,17 +4055,21 @@
               let d = new Date(yyyy, mn - 1, dd, hh, m, 0, 0);
               
               const timestamp = d.getTime();
+              const taskId = Date.now().toString();
+              const taskText = newTugas.trim();
               setTugasItems(prev => [...prev, {
-                  id: Date.now().toString(),
-                  text: newTugas.trim(),
+                  id: taskId,
+                  text: taskText,
                   deadline: timestamp,
                   category: newTugasCategory,
                   isDone: false,
                   createdAt: Date.now()
               }]);
+              // Schedule Capacitor notification at deadline
+              klipNotify.schedule({ id: 'tugas_' + taskId, title: 'Tenggat Tugas ⏰', body: taskText, atMs: timestamp });
               setNewTugas('');
               setNewTugasTime('23:59');
-              playClick('soft');
+              playClick('success');
           };
 
 
@@ -3600,7 +4081,14 @@
                           // Prevent ghost click immediately after creation (mobile web touch bug)
                           if (!t.isDone && Date.now() - t.createdAt < 500) return t;
                           allowPlay = true;
-                          return { ...t, isDone: !t.isDone };
+                          const nowDone = !t.isDone;
+                          // Cancel notification when done, reschedule when undone
+                          if (nowDone) {
+                            klipNotify.cancel('tugas_' + id);
+                          } else if (t.deadline && t.deadline > Date.now()) {
+                            klipNotify.schedule({ id: 'tugas_' + id, title: 'Tenggat Tugas ⏰', body: t.text, atMs: t.deadline });
+                          }
+                          return { ...t, isDone: nowDone };
                       }
                       return t;
                   });
@@ -3610,8 +4098,9 @@
           };
 
           const delTask = (id) => {
-              setTugasItems(prev => prev.filter(t => t.id !== id));
-              playClick('soft');
+              klipNotify.cancel('tugas_' + id);
+               setTugasItems(prev => prev.filter(t => t.id !== id));
+              playClick('delete');
           };
 
           const formatDeadline = (ts) => {
@@ -3715,7 +4204,8 @@
 
                       {/* Animated sine wave SVG — horizontal scroll only */}
                       <div className="absolute inset-0 z-0 pointer-events-none">
-                          <svg className="w-[200%] h-[150%] absolute top-1/2 -translate-y-1/2 -left-[100%] animate-[wave_12s_linear_infinite]"
+                          <svg className="motion-stable w-[200%] h-[150%] absolute top-1/2 -translate-y-1/2 -left-[100%] animate-[wave_12s_linear_infinite]"
+                               data-motion-stable="wave"
                                preserveAspectRatio="none" viewBox="0 0 100 50" fill="none" strokeWidth="1.5">
                               <style>{`@keyframes wave{0%{transform:translate(0,-50%)}100%{transform:translate(50%,-50%)}}`}</style>
                               <path className="stroke-slate-800/55 dark:stroke-white/55"
@@ -3888,15 +4378,11 @@
           pct = activeTimer.durationMs ? (1 - (rem / activeTimer.durationMs)) * 100 : 100;
         }
 
-        const isShowingToast = toastMsg && !bubbleExpanded;
-
         let bubbleW, bubbleH, bubbleR;
         if (bubbleExpanded) {
           bubbleW = 'w-[calc(100%-1.5rem)] max-w-[380px]'; 
           bubbleH = 'h-[160px]';
           bubbleR = 'rounded-[2.5rem]';
-        } else if (isShowingToast) {
-          bubbleW = 'w-auto min-w-[140px] max-w-[280px]'; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
         } else if (activeTimer) {
           bubbleW = `w-[${bubbleTimerWidth}px]`; bubbleH = 'h-[28px]'; bubbleR = 'rounded-[14px]';
         } else {
@@ -3915,14 +4401,10 @@
                 {/* Collapsed State */}
                 {!bubbleExpanded && (
                   <div className="absolute inset-0 flex items-center whitespace-nowrap overflow-hidden">
-                    {isShowingToast ? (
-                       <div className="w-full flex justify-center px-4">
-                          <span className="text-white text-[0.6875rem] font-bold truncate">{toastMsg}</span>
-                       </div>
-                    ) : activeTimer ? (
+                    {activeTimer ? (
                        <div className="flex items-center justify-between w-full px-2">
                           <span className="text-white text-[0.8125rem] font-mono font-black">{remText}</span>
-                          <Timer size={14} className={(activeTimer.paused ? "text-amber-400" : "text-emerald-400") + " " + (!activeTimer.paused ? "animate-pulse" : "")} />
+                          <Timer size={14} data-motion-stable={!activeTimer.paused ? "pulse" : undefined} className={(activeTimer.paused ? "text-amber-400" : "text-emerald-400") + " " + (!activeTimer.paused ? "motion-stable animate-pulse" : "")} />
                        </div>
                     ) : null}
                   </div>
@@ -3966,10 +4448,6 @@
                           </button>
                           
                           <button onClick={(e) => { e.stopPropagation(); skipTimer(activeTimer.id, -60000); }} className="text-white/70 hover:text-white active:scale-90 transition-all font-bold text-xs">+1m</button>
-                          
-                          <button onClick={(e) => { e.stopPropagation(); endTimer(activeTimer.id); setBubbleExpanded(false); }} className="absolute right-2 h-8 w-8 bg-white/10 hover:bg-rose-500/50 hover:text-white text-white/50 rounded-full flex items-center justify-center active:scale-90 transition-all">
-                            <X size={14}/>
-                          </button>
                         </div>
                       </div>
                     ) : (
@@ -4033,9 +4511,6 @@
 
                         {/* Logs Section */}
                         <div className="flex-1 overflow-y-auto hide-scrollbar flex flex-col min-h-0 bg-white/[0.02] border border-white/5 rounded-2xl p-3 relative">
-                          <button onClick={(e) => { e.stopPropagation(); setBubbleExpanded(false); }} className="absolute top-2 right-2 h-6 w-6 bg-white/5 hover:bg-rose-500/50 hover:text-white text-white/30 rounded-full flex items-center justify-center transition-all z-20">
-                            <X size={10}/>
-                          </button>
                           <span className="text-white/30 text-[0.5625rem] font-black uppercase tracking-[0.12em] flex items-center gap-1.5 mb-2 flex-shrink-0"><Sparkles size={10}/> {tr('Log Sistem','System Logs')}</span>
                           {sysLogs.length === 0 ? (
                             <div className="flex flex-col items-center justify-center h-full opacity-25 pb-4">
@@ -4072,8 +4547,12 @@
           {reduceMotion !== 'default' && (
             <style>
               {reduceMotion === 'fast' 
-                 ? `*, *::before, *::after { animation-duration: 0.1s !important; transition-duration: 0.15s !important; }`
-                 : `*, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }`
+                 ? `*, *::before, *::after { animation-duration: 0.1s !important; transition-duration: 0.15s !important; }
+                    .motion-stable[data-motion-stable="wave"] { animation-duration: 12s !important; }
+                    .motion-stable[data-motion-stable="pulse"] { animation-duration: 2s !important; }`
+                 : `*, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+                    .motion-stable[data-motion-stable="wave"] { animation-duration: 12s !important; }
+                    .motion-stable[data-motion-stable="pulse"] { animation-duration: 2s !important; }`
               }
             </style>
           )}
@@ -4171,8 +4650,8 @@
           )}
 
           {toastMsg&&(
-            <div className="absolute top-12 inset-x-0 flex justify-center z-[110] pointer-events-none">
-              <div className="bg-slate-900/95 dark:bg-white/95 backdrop-blur-xl text-white dark:text-slate-900 px-5 py-2.5 rounded-2xl shadow-2xl flex items-center gap-2.5 slide-down border border-white/10 dark:border-slate-200 pointer-events-auto" style={{maxWidth:'85%'}}>
+            <div className="absolute bottom-[calc(env(safe-area-inset-bottom,0px)+5.5rem)] inset-x-0 flex justify-center z-[110] pointer-events-none">
+              <div className="bg-slate-900/95 dark:bg-white/95 backdrop-blur-xl text-white dark:text-slate-900 px-5 py-2.5 rounded-2xl shadow-2xl flex items-center gap-2.5 slide-up border border-white/10 dark:border-slate-200 pointer-events-auto" style={{maxWidth:'85%'}}>
                 <div className={`h-5 w-5 rounded-full flex items-center justify-center flex-shrink-0 ${th.bg}`}><Check size={11} className="text-white" strokeWidth={3}/></div>
                 <span className="font-bold text-sm tracking-wide whitespace-nowrap">{toastMsg}</span>
               </div>
